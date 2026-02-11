@@ -292,6 +292,52 @@ def test_parent_class_handle_issubclass_semantics() -> None:
         counter_cls.close()
 
 
+def test_parent_class_handle_satisfies_real_type_requirement() -> None:
+    """Parent-origin class handles should satisfy ``type(...)`` base checks."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        result: object = counter.class_handle_requires_real_type(BaseLocalClass)
+        assert result is True
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_parent_class_handle_schema_like_payload_accepts_real_type() -> None:
+    """Nested payloads containing parent class handles should work in type-required paths."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+
+        class LocalModel:
+            """Function-local model used to force parent-handle transport."""
+
+            x: int
+
+            def __init__(self, x: object) -> None:
+                """Initialize model value.
+
+                :param x: Raw value to convert.
+                """
+                self.x = int(x)
+
+        schema_like_payload: dict[str, object] = {
+            "cls": LocalModel,
+            "kwargs": {"x": "1"},
+        }
+        instance: object = counter.class_handle_schema_like_constructor(schema_like_payload)
+        assert instance.__class__ is LocalModel
+        assert getattr(instance, "x") == 1
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
 def test_parent_handle_roundtrip_returns_same_object_without_release_error() -> None:
     """Roundtripping a parent-origin non-picklable handle should preserve identity."""
     counter_cls: type = extradite(TARGET)

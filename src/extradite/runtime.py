@@ -1350,6 +1350,28 @@ class ExtraditeSession:
                 result = callable_obj(*args, **kwargs)  # type: ignore[operator]
             return {"value": self._encode_for_child(result)}
 
+        if action == "describe_object":
+            object_id_obj = message.get("object_id")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("object_id must be an integer")
+
+            target: object = self._local_object_registry.get(object_id_obj)
+            is_type: bool = isinstance(target, type)
+            if is_type is False:
+                return {"is_type": False}
+
+            target_type: type[object] = target
+            encoded_bases: list[object] = []
+            for base in target_type.__bases__:
+                encoded_bases.append(self._encode_for_child(base))
+            return {
+                "is_type": True,
+                "type_name": target_type.__name__,
+                "type_qualname": target_type.__qualname__,
+                "type_module": target_type.__module__,
+                "bases": encoded_bases,
+            }
+
         if action == "release_object":
             object_id_obj = message.get("object_id")
             if isinstance(object_id_obj, int) is False:

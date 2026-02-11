@@ -113,6 +113,7 @@ Parent-origin class handles preserve core type-style behavior in the isolated si
 - `repr(class_handle)`
 - `isinstance(value, class_handle)`
 - `issubclass(subclass, class_handle)`
+- C-extension-style type checks that require a real `type` object (for example, `type("X", (class_handle,), {})` base validation).
 
 Parent-handle roundtrips are also stable: passing a parent object by handle and returning it back preserves identity without spurious released-handle errors.
 

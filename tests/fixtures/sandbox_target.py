@@ -113,6 +113,31 @@ class IsolatedCounter:
         """
         return issubclass(subclass, class_handle)  # type: ignore[arg-type]
 
+    def class_handle_requires_real_type(self, class_handle: object) -> bool:
+        """Exercise a code path that requires ``class_handle`` to be a real type object.
+
+        :param class_handle: Candidate class handle.
+        :returns: ``True`` when dynamic subclass creation succeeds.
+        :raises TypeError: If ``class_handle`` is not a real type object.
+        """
+        derived: type = type("DerivedFromHandle", (class_handle,), {})  # type: ignore[arg-type]
+        return issubclass(derived, class_handle)  # type: ignore[arg-type]
+
+    def class_handle_schema_like_constructor(self, schema: dict[str, object]) -> object:
+        """Exercise schema-like payload handling that expects a real type object.
+
+        :param schema: Schema-like dictionary containing ``cls`` and ``kwargs``.
+        :returns: Constructed instance from ``schema['cls'](**schema['kwargs'])``.
+        :raises TypeError: If ``schema`` does not contain the expected payload types.
+        """
+        class_handle: object = schema["cls"]
+        kwargs_obj: object = schema["kwargs"]
+        if isinstance(kwargs_obj, dict) is False:
+            raise TypeError("schema['kwargs'] must be a dict")
+
+        _ = type("DerivedFromSchema", (class_handle,), {})  # type: ignore[arg-type]
+        return class_handle(**kwargs_obj)  # type: ignore[arg-type,operator]
+
     def inspect_marker(self, payload: object) -> str:
         """Read ``payload.marker`` and return it as a string.
 

@@ -16,6 +16,8 @@ WIRE_REF_TAG: str = "__extradite_transport_ref_v1__"
 OWNER_PARENT: str = "parent"
 OWNER_CHILD: str = "child"
 TransportPolicy = Literal["value", "reference"]
+_PARENT_TYPE_PROXY_RUNTIME_ATTR: str = "__extradite_parent_type_proxy_runtime__"
+_PARENT_TYPE_PROXY_OBJECT_ID_ATTR: str = "__extradite_parent_type_proxy_object_id__"
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -145,6 +147,28 @@ def _is_force_reference_candidate(value: object) -> bool:
     if isinstance(value, (type(None), bool, int, float, complex, str, bytes)) is True:
         return False
     return True
+
+
+def _extract_parent_type_proxy_object_id(value: object) -> int | None:
+    """Return parent object id when ``value`` is a parent type proxy.
+
+    :param value: Candidate value.
+    :returns: Parent object identifier or ``None``.
+    """
+    if isinstance(value, type) is False:
+        return None
+
+    try:
+        object_id_obj: object = type.__getattribute__(value, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+        runtime_obj: object = type.__getattribute__(value, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+    except AttributeError:
+        return None
+
+    if isinstance(object_id_obj, int) is False:
+        return None
+    if isinstance(runtime_obj, WorkerRuntime) is False:
+        return None
+    return object_id_obj
 
 
 class ObjectRegistry:
@@ -357,6 +381,174 @@ def _require_str_field(message: dict[str, object], key: str) -> str:
     if isinstance(value, str) is False:
         raise ExtraditeProtocolError(f"{key} must be a string")
     return value
+
+
+class _ParentTypeCloseProxy:
+    """Callable close wrapper for parent-origin type proxies."""
+
+    _runtime: "WorkerRuntime"
+    _object_id: int
+
+    def __init__(self, runtime: "WorkerRuntime", object_id: int) -> None:
+        """Initialize a close wrapper.
+
+        :param runtime: Worker runtime.
+        :param object_id: Parent-owned object identifier.
+        """
+        self._runtime = runtime
+        self._object_id = object_id
+
+    def __call__(self) -> None:
+        """Release one parent-owned type handle."""
+        self._runtime.release_parent_object(self._object_id)
+
+
+class _ParentTypeProxyMeta(type):
+    """Metaclass used for parent-origin type handles."""
+
+    def __getattribute__(cls, attr_name: str) -> object:
+        """Resolve attributes from local metadata or parent process.
+
+        :param attr_name: Attribute name.
+        :returns: Attribute value.
+        """
+        if attr_name == "close":
+            runtime_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+            object_id_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+            if isinstance(runtime_obj, WorkerRuntime) is False:
+                raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+            return _ParentTypeCloseProxy(runtime_obj, object_id_obj)
+
+        try:
+            return super().__getattribute__(attr_name)
+        except AttributeError:
+            runtime_obj = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+            object_id_obj = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+            if isinstance(runtime_obj, WorkerRuntime) is False:
+                raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+            return runtime_obj.get_parent_attr(object_id_obj, attr_name)
+
+    def __setattr__(cls, attr_name: str, value: object) -> None:
+        """Set attributes in the parent process.
+
+        :param attr_name: Attribute name.
+        :param value: Attribute value.
+        """
+        is_internal: bool = attr_name.startswith("_")
+        if is_internal is True:
+            super().__setattr__(attr_name, value)
+            return
+
+        runtime_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+        object_id_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+        if isinstance(runtime_obj, WorkerRuntime) is False:
+            raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+        if isinstance(object_id_obj, int) is False:
+            raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+        runtime_obj.set_parent_attr(object_id_obj, attr_name, value)
+
+    def __delattr__(cls, attr_name: str) -> None:
+        """Delete attributes in the parent process.
+
+        :param attr_name: Attribute name.
+        """
+        is_internal: bool = attr_name.startswith("_")
+        if is_internal is True:
+            super().__delattr__(attr_name)
+            return
+
+        runtime_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+        object_id_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+        if isinstance(runtime_obj, WorkerRuntime) is False:
+            raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+        if isinstance(object_id_obj, int) is False:
+            raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+        runtime_obj.del_parent_attr(object_id_obj, attr_name)
+
+    def __call__(cls, *args: object, **kwargs: object) -> object:
+        """Instantiate the parent-origin class handle.
+
+        :param args: Positional arguments.
+        :param kwargs: Keyword arguments.
+        :returns: Decoded constructor result.
+        """
+        runtime_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+        object_id_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+        if isinstance(runtime_obj, WorkerRuntime) is False:
+            raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+        if isinstance(object_id_obj, int) is False:
+            raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+        return runtime_obj.call_parent_attr(object_id_obj, "__call__", list(args), kwargs)
+
+    def __instancecheck__(cls, instance: object) -> bool:
+        """Evaluate ``isinstance(instance, cls)`` via parent semantics.
+
+        :param instance: Candidate instance.
+        :returns: ``True`` when parent-side ``isinstance`` succeeds.
+        """
+        runtime_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+        object_id_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+        if isinstance(runtime_obj, WorkerRuntime) is False:
+            raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+        if isinstance(object_id_obj, int) is False:
+            raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+        result: object = runtime_obj.call_parent_attr(object_id_obj, "__instancecheck__", [instance], {})
+        if isinstance(result, bool) is False:
+            raise ExtraditeProtocolError("Remote __instancecheck__ did not return bool")
+        return result
+
+    def __subclasscheck__(cls, subclass: object) -> bool:
+        """Evaluate ``issubclass(subclass, cls)`` via parent semantics.
+
+        :param subclass: Candidate subclass.
+        :returns: ``True`` when parent-side ``issubclass`` succeeds.
+        """
+        runtime_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+        object_id_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+        if isinstance(runtime_obj, WorkerRuntime) is False:
+            raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+        if isinstance(object_id_obj, int) is False:
+            raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+        result: object = runtime_obj.call_parent_attr(object_id_obj, "__subclasscheck__", [subclass], {})
+        if isinstance(result, bool) is False:
+            raise ExtraditeProtocolError("Remote __subclasscheck__ did not return bool")
+        return result
+
+    def __repr__(cls) -> str:
+        """Return parent ``repr`` for this type proxy.
+
+        :returns: Parent representation string.
+        """
+        runtime_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+        object_id_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+        if isinstance(runtime_obj, WorkerRuntime) is False:
+            raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+        if isinstance(object_id_obj, int) is False:
+            raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+        value: object = runtime_obj.call_parent_attr(object_id_obj, "__repr__", [], {})
+        if isinstance(value, str) is False:
+            raise ExtraditeProtocolError("Remote __repr__ did not return a string")
+        return value
+
+    def __str__(cls) -> str:
+        """Return parent ``str`` for this type proxy.
+
+        :returns: Parent string representation.
+        """
+        runtime_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_RUNTIME_ATTR)
+        object_id_obj: object = type.__getattribute__(cls, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR)
+        if isinstance(runtime_obj, WorkerRuntime) is False:
+            raise ExtraditeProtocolError("Parent type proxy runtime metadata is invalid")
+        if isinstance(object_id_obj, int) is False:
+            raise ExtraditeProtocolError("Parent type proxy object id metadata is invalid")
+        value: object = runtime_obj.call_parent_attr(object_id_obj, "__str__", [], {})
+        if isinstance(value, str) is False:
+            raise ExtraditeProtocolError("Remote __str__ did not return a string")
+        return value
 
 
 class _ParentCallProxy:
@@ -706,7 +898,8 @@ class WorkerRuntime:
     _protected_module_names: set[str]
     _transport_policy: TransportPolicy
     _next_request_id: int
-    _parent_proxy_cache: "weakref.WeakValueDictionary[int, _ParentRemoteHandle]"
+    _parent_proxy_cache: "weakref.WeakValueDictionary[int, object]"
+    _parent_proxy_is_type_cache: dict[int, bool]
 
     def __init__(self, connection: Connection, transport_policy: TransportPolicy = "value") -> None:
         """Initialize worker runtime state.
@@ -728,6 +921,7 @@ class WorkerRuntime:
         self._transport_policy = transport_policy
         self._next_request_id = 1
         self._parent_proxy_cache = weakref.WeakValueDictionary()
+        self._parent_proxy_is_type_cache = {}
 
     def run(self) -> None:
         """Run the worker message loop."""
@@ -768,6 +962,7 @@ class WorkerRuntime:
 
         self._registry.clear()
         self._parent_proxy_cache.clear()
+        self._parent_proxy_is_type_cache.clear()
         self._connection.close()
 
     def _handle_incoming_request(self, request_message: dict[str, object]) -> bool:
@@ -888,6 +1083,9 @@ class WorkerRuntime:
         """
         if isinstance(value, _ParentRemoteHandle) is True:
             return (WIRE_REF_TAG, OWNER_PARENT, value.remote_object_id)
+        parent_type_proxy_object_id: int | None = _extract_parent_type_proxy_object_id(value)
+        if parent_type_proxy_object_id is not None:
+            return (WIRE_REF_TAG, OWNER_PARENT, parent_type_proxy_object_id)
 
         seen_ids: set[int] = set()
         contains_protected: bool = _value_originates_from_module(value, self._protected_module_names, seen_ids)
@@ -1043,19 +1241,99 @@ class WorkerRuntime:
 
         raise ExtraditeProtocolError(f"Unsupported action: {action}")
 
-    def _get_or_create_parent_proxy(self, object_id: int) -> _ParentRemoteHandle:
+    def _describe_parent_object(self, object_id: int) -> dict[str, object]:
+        """Describe one parent-owned object.
+
+        :param object_id: Parent-owned object identifier.
+        :returns: Description payload from the parent.
+        :raises ExtraditeProtocolError: If payload shape is invalid.
+        """
+        payload: dict[str, object] = self._send_request_to_parent(
+            "describe_object",
+            {"object_id": object_id},
+        )
+        is_type_obj: object = payload.get("is_type")
+        if isinstance(is_type_obj, bool) is False:
+            raise ExtraditeProtocolError("describe_object payload missing bool is_type")
+        return payload
+
+    def _create_parent_type_proxy(self, object_id: int, description: dict[str, object]) -> type[object]:
+        """Create one local type proxy for a parent-origin type handle.
+
+        :param object_id: Parent-owned type object identifier.
+        :param description: Parent description payload.
+        :returns: Local class object that proxies to the parent type.
+        :raises ExtraditeProtocolError: If description payload is malformed.
+        """
+        type_name_obj: object = description.get("type_name")
+        if isinstance(type_name_obj, str) is False:
+            raise ExtraditeProtocolError("describe_object payload missing str type_name")
+        type_qualname_obj: object = description.get("type_qualname")
+        if isinstance(type_qualname_obj, str) is False:
+            raise ExtraditeProtocolError("describe_object payload missing str type_qualname")
+        type_module_obj: object = description.get("type_module")
+        if isinstance(type_module_obj, str) is False:
+            raise ExtraditeProtocolError("describe_object payload missing str type_module")
+        encoded_bases_obj: object = description.get("bases")
+        if isinstance(encoded_bases_obj, list) is False:
+            raise ExtraditeProtocolError("describe_object payload missing list bases")
+
+        decoded_bases: list[type[object]] = []
+        for encoded_base in encoded_bases_obj:
+            decoded_base_obj: object = self._decode_from_parent(encoded_base)
+            if isinstance(decoded_base_obj, type) is False:
+                raise ExtraditeProtocolError("describe_object base entries must decode to type")
+            decoded_bases.append(decoded_base_obj)
+
+        bases_tuple: tuple[type[object], ...]
+        if len(decoded_bases) == 0:
+            bases_tuple = ()
+        else:
+            bases_tuple = tuple(decoded_bases)
+
+        namespace: dict[str, object] = {
+            "__module__": type_module_obj,
+            "__qualname__": type_qualname_obj,
+        }
+        proxy_type: type[object] = _ParentTypeProxyMeta(type_name_obj, bases_tuple, namespace)
+        type.__setattr__(proxy_type, _PARENT_TYPE_PROXY_RUNTIME_ATTR, self)
+        type.__setattr__(proxy_type, _PARENT_TYPE_PROXY_OBJECT_ID_ATTR, object_id)
+        return proxy_type
+
+    def _get_or_create_parent_proxy(self, object_id: int) -> object:
         """Return cached parent proxy or create a new one.
 
         :param object_id: Parent-owned object identifier.
         :returns: Parent object proxy.
         """
-        cached: _ParentRemoteHandle | None = self._parent_proxy_cache.get(object_id)
+        cached: object | None = self._parent_proxy_cache.get(object_id)
         if cached is not None:
             return cached
 
-        created: _ParentRemoteHandle = _ParentRemoteHandle(self, object_id)
-        self._parent_proxy_cache[object_id] = created
-        return created
+        is_type_cached: bool | None = self._parent_proxy_is_type_cache.get(object_id)
+        is_type: bool
+        description: dict[str, object] | None
+        if is_type_cached is None:
+            description = self._describe_parent_object(object_id)
+            is_type_obj: object = description.get("is_type")
+            if isinstance(is_type_obj, bool) is False:
+                raise ExtraditeProtocolError("describe_object payload missing bool is_type")
+            is_type = is_type_obj
+            self._parent_proxy_is_type_cache[object_id] = is_type
+        else:
+            is_type = is_type_cached
+            description = None
+
+        if is_type is True:
+            if description is None:
+                description = self._describe_parent_object(object_id)
+            created_type: type[object] = self._create_parent_type_proxy(object_id, description)
+            self._parent_proxy_cache[object_id] = created_type
+            return created_type
+
+        created_handle: _ParentRemoteHandle = _ParentRemoteHandle(self, object_id)
+        self._parent_proxy_cache[object_id] = created_handle
+        return created_handle
 
     def _send_request_to_parent(self, action: str, payload: dict[str, object]) -> dict[str, object]:
         """Send one request to the parent and await the correlated response.
@@ -1241,6 +1519,7 @@ class WorkerRuntime:
         :param object_id: Parent-owned object identifier.
         """
         self._parent_proxy_cache.pop(object_id, None)
+        self._parent_proxy_is_type_cache.pop(object_id, None)
         self._send_request_to_parent(
             "release_object",
             {
