@@ -26,6 +26,9 @@ from extradite.worker import worker_entry
 
 _SHARED_SESSION_LOCK: threading.RLock = threading.RLock()
 _SHARED_SESSIONS_BY_KEY: dict[str, "ExtraditeSession"] = {}
+_IMPORT_HOOK_LOCK: threading.Lock = threading.Lock()
+_IMPORT_HOOK_INSTALLED: bool = False
+_IMPORT_EPOCH: int = 0
 TransportPolicy = Literal["value", "reference"]
 PolicySource = Literal["call_override", "type_rule", "session_default"]
 CALL_POLICY_KWARG: str = "__extradite_policy__"
@@ -94,6 +97,38 @@ def _find_module_leaks(module_name: str) -> list[str]:
             leaks.append(loaded_name)
     leaks.sort()
     return leaks
+
+
+def _on_audit_event(event: str, args: tuple[object, ...]) -> None:
+    """Track interpreter import activity.
+
+    :param event: Audit hook event name.
+    :param args: Event payload tuple.
+    """
+    _ = args
+    if event != "import":
+        return
+
+    global _IMPORT_EPOCH
+    _IMPORT_EPOCH += 1
+
+
+def _ensure_import_hook_installed() -> None:
+    """Install the process-level import activity hook exactly once."""
+    global _IMPORT_HOOK_INSTALLED
+    with _IMPORT_HOOK_LOCK:
+        if _IMPORT_HOOK_INSTALLED is True:
+            return
+        sys.addaudithook(_on_audit_event)
+        _IMPORT_HOOK_INSTALLED = True
+
+
+def _get_import_epoch() -> int:
+    """Return the current import activity counter.
+
+    :returns: Monotonic import-activity counter.
+    """
+    return _IMPORT_EPOCH
 
 
 class _RootSafeUnpickler(pickle.Unpickler):
@@ -818,6 +853,8 @@ class ExtraditeSession:
     _protected_module_names: set[str]
     _class_object_ids_by_target: dict[str, int]
     _target_reference_counts: dict[str, int]
+    _last_checked_import_epoch: int
+    _last_checked_sys_modules_size: int
 
     def __init__(
         self,
@@ -833,6 +870,7 @@ class ExtraditeSession:
         :param transport_policy: Wire transport policy for picklable values.
         :param transport_type_rules: Optional per-type transport rules.
         """
+        _ensure_import_hook_installed()
         self._share_key = share_key
         self._transport_policy = transport_policy
         if transport_type_rules is None:
@@ -852,6 +890,8 @@ class ExtraditeSession:
         self._protected_module_names = set()
         self._class_object_ids_by_target = {}
         self._target_reference_counts = {}
+        self._last_checked_import_epoch = _get_import_epoch()
+        self._last_checked_sys_modules_size = len(sys.modules)
 
     @property
     def is_closed(self) -> bool:
@@ -978,9 +1018,42 @@ class ExtraditeSession:
 
     def _assert_protected_modules_not_loaded(self) -> None:
         """Ensure all protected modules are absent from root-process imports."""
-        protected_module_names: list[str] = sorted(self._protected_module_names)
-        for module_name in protected_module_names:
-            self._assert_module_not_loaded(module_name)
+        protected_module_count: int = len(self._protected_module_names)
+        if protected_module_count == 0:
+            self._refresh_import_state_snapshot()
+            return
+
+        current_epoch: int = _get_import_epoch()
+        current_sys_modules_size: int = len(sys.modules)
+        import_epoch_unchanged: bool = current_epoch == self._last_checked_import_epoch
+        sys_modules_size_unchanged: bool = (
+            current_sys_modules_size == self._last_checked_sys_modules_size
+        )
+        if import_epoch_unchanged is True and sys_modules_size_unchanged is True:
+            return
+
+        while True:
+            scan_start_epoch: int = _get_import_epoch()
+            scan_start_sys_modules_size: int = len(sys.modules)
+            protected_module_names: list[str] = sorted(self._protected_module_names)
+            for module_name in protected_module_names:
+                self._assert_module_not_loaded(module_name)
+
+            scan_end_epoch: int = _get_import_epoch()
+            scan_end_sys_modules_size: int = len(sys.modules)
+            same_epoch: bool = scan_end_epoch == scan_start_epoch
+            same_sys_modules_size: bool = (
+                scan_end_sys_modules_size == scan_start_sys_modules_size
+            )
+            if same_epoch is True and same_sys_modules_size is True:
+                self._last_checked_import_epoch = scan_end_epoch
+                self._last_checked_sys_modules_size = scan_end_sys_modules_size
+                return
+
+    def _refresh_import_state_snapshot(self) -> None:
+        """Capture current root-process import state for fast-path checks."""
+        self._last_checked_import_epoch = _get_import_epoch()
+        self._last_checked_sys_modules_size = len(sys.modules)
 
     def _require_connection(self) -> Connection:
         """Return the active IPC connection.

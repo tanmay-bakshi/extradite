@@ -12,6 +12,7 @@ from collections.abc import Iterator
 
 import pytest
 
+import extradite.runtime as runtime
 from extradite import ExtraditeModuleLeakError
 from extradite import ExtraditeProtocolError
 from extradite import ExtraditeRemoteError
@@ -710,6 +711,63 @@ def test_protected_module_import_before_bootstrap_fails_fast() -> None:
     importlib.import_module(TARGET_MODULE)
     with pytest.raises(ExtraditeModuleLeakError):
         extradite(TARGET)
+
+
+def test_protected_module_import_after_bootstrap_fails_on_next_boundary_call() -> None:
+    """Importing the protected module after bootstrap must fail at the next call boundary."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(3)
+        baseline: object = counter.increment(1)
+        assert baseline == 4
+
+        importlib.import_module(TARGET_MODULE)
+        with pytest.raises(ExtraditeModuleLeakError):
+            counter.increment(1)
+    finally:
+        _purge_module(TARGET_MODULE)
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_protected_module_scan_fast_path_when_import_state_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip repeated leak scans when root-process import state has not changed."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    find_calls: int = 0
+    original_find_module_leaks: object = runtime._find_module_leaks
+
+    def _counting_find(module_name: str) -> list[str]:
+        """Count leak-scan invocations while delegating to the real scanner.
+
+        :param module_name: Protected module name.
+        :returns: Matching leaked module list.
+        """
+        nonlocal find_calls
+        find_calls += 1
+        if callable(original_find_module_leaks) is False:
+            raise TypeError("original leak scanner must be callable")
+        return original_find_module_leaks(module_name)  # type: ignore[operator]
+
+    monkeypatch.setattr(runtime, "_find_module_leaks", _counting_find)
+    try:
+        counter = counter_cls(1)
+        warmup: object = counter.increment(0)
+        assert warmup == 1
+        find_calls_after_warmup: int = find_calls
+
+        for _ in range(50):
+            counter.increment(1)
+
+        assert find_calls == find_calls_after_warmup
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
 
 
 def test_bootstrap_path_never_imports_protected_module_in_root() -> None:
