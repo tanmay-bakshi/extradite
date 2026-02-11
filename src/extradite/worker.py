@@ -19,6 +19,7 @@ TransportPolicy = Literal["value", "reference"]
 _BULK_PICKLE_MIN_ITEMS: int = 32
 _PARENT_TYPE_PROXY_RUNTIME_ATTR: str = "__extradite_parent_type_proxy_runtime__"
 _PARENT_TYPE_PROXY_OBJECT_ID_ATTR: str = "__extradite_parent_type_proxy_object_id__"
+BatchCallSpec = tuple[list[object], dict[str, object]]
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -1287,6 +1288,25 @@ class WorkerRuntime:
             kwargs[key] = self._decode_from_parent(item)
         return args, kwargs
 
+    def _decode_batch_call_specs_from_parent(self, message: dict[str, object]) -> list[BatchCallSpec]:
+        """Decode a batched call specification list from one request message.
+
+        :param message: Request message.
+        :returns: Decoded list of ``(args, kwargs)`` call specifications.
+        :raises ExtraditeProtocolError: If request payload shape is invalid.
+        """
+        raw_calls_obj: object = message.get("calls")
+        if isinstance(raw_calls_obj, list) is False:
+            raise ExtraditeProtocolError("calls must be a list")
+
+        decoded_call_specs: list[BatchCallSpec] = []
+        for call_index, raw_call_obj in enumerate(raw_calls_obj):
+            if isinstance(raw_call_obj, dict) is False:
+                raise ExtraditeProtocolError(f"calls[{call_index}] must be a dict")
+            decoded_args, decoded_kwargs = self._decode_args_from_parent(raw_call_obj)
+            decoded_call_specs.append((decoded_args, decoded_kwargs))
+        return decoded_call_specs
+
     def _execute_request(self, message: dict[str, object]) -> dict[str, object]:
         """Execute one request from the parent.
 
@@ -1353,6 +1373,22 @@ class WorkerRuntime:
                 raise ExtraditeProtocolError(f"Attribute {attr_name!r} is not callable")
             result: object = callable_obj(*args, **kwargs)  # type: ignore[operator]
             return {"value": self._encode_for_parent(result)}
+
+        if action == "call_attr_batch":
+            object_id = _require_int_field(message, "object_id")
+            attr_name = _require_str_field(message, "attr_name")
+            call_specs: list[BatchCallSpec] = self._decode_batch_call_specs_from_parent(message)
+            target = self._registry.get(object_id)
+            callable_obj: object = getattr(target, attr_name)
+            is_callable = callable(callable_obj)
+            if is_callable is False:
+                raise ExtraditeProtocolError(f"Attribute {attr_name!r} is not callable")
+
+            encoded_values: list[object] = []
+            for args, kwargs in call_specs:
+                result: object = callable_obj(*args, **kwargs)  # type: ignore[operator]
+                encoded_values.append(self._encode_for_parent(result))
+            return {"values": encoded_values}
 
         if action == "release_object":
             object_id = _require_int_field(message, "object_id")

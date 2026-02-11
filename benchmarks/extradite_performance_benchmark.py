@@ -198,6 +198,37 @@ def _require_str(value: object, field_name: str) -> str:
     return value
 
 
+def _invoke_callable_batch_if_supported(
+    callable_obj: object,
+    call_specs: list[tuple[list[object], dict[str, object]]],
+) -> list[object]:
+    """Invoke a callable via its batch API when available.
+
+    :param callable_obj: Callable object to invoke.
+    :param call_specs: Ordered call specifications.
+    :returns: Ordered list of call results.
+    :raises TypeError: If ``callable_obj`` is not callable or batch result shape is invalid.
+    """
+    callable_flag: bool = callable(callable_obj)
+    if callable_flag is False:
+        raise TypeError("callable_obj must be callable")
+
+    batch_attr_obj: object = getattr(callable_obj, "batch", None)
+    batch_callable: bool = callable(batch_attr_obj)
+    if batch_callable is True:
+        batch_method: Callable[[list[tuple[list[object], dict[str, object]]]], object] = batch_attr_obj  # type: ignore[assignment]
+        batched_result_obj: object = batch_method(call_specs)
+        if isinstance(batched_result_obj, list) is False:
+            raise TypeError("batch() must return list")
+        return batched_result_obj
+
+    result_list: list[object] = []
+    for call_args, call_kwargs in call_specs:
+        result_obj: object = callable_obj(*call_args, **call_kwargs)  # type: ignore[operator]
+        result_list.append(result_obj)
+    return result_list
+
+
 def _run_case_tiny_ping(workload: object, iterations: int) -> dict[str, object]:
     """Run the tiny ping-call regime.
 
@@ -210,11 +241,23 @@ def _run_case_tiny_ping(workload: object, iterations: int) -> dict[str, object]:
     if ping_is_callable is False:
         raise TypeError("workload.ping must be callable")
     ping_method: Callable[[], object] = ping_obj  # type: ignore[assignment]
-
+    batch_size: int = 1024
+    completed: int = 0
     accumulator: int = 0
-    for _ in range(iterations):
-        result_obj: object = ping_method()
-        accumulator ^= _require_int(result_obj, "ping result")
+    while completed < iterations:
+        remaining: int = iterations - completed
+        current_batch_size: int = batch_size
+        if remaining < batch_size:
+            current_batch_size = remaining
+        call_specs: list[tuple[list[object], dict[str, object]]] = [
+            ([], {}) for _ in range(current_batch_size)
+        ]
+        batch_results: list[object] = _invoke_callable_batch_if_supported(ping_method, call_specs)
+        if len(batch_results) != current_batch_size:
+            raise ValueError("batch result length mismatch for ping")
+        for result_obj in batch_results:
+            accumulator ^= _require_int(result_obj, "ping result")
+        completed += current_batch_size
     return {"xor": accumulator}
 
 
@@ -239,10 +282,26 @@ def _run_case_increment_small(workload: object, iterations: int) -> dict[str, ob
     seed_obj: object = set_value_method(0)
     _ = _require_int(seed_obj, "set_value result")
 
+    batch_size: int = 1024
+    completed: int = 0
     final_value: int = 0
-    for _ in range(iterations):
-        result_obj: object = increment_method(1)
-        final_value = _require_int(result_obj, "increment result")
+    while completed < iterations:
+        remaining: int = iterations - completed
+        current_batch_size: int = batch_size
+        if remaining < batch_size:
+            current_batch_size = remaining
+        call_specs: list[tuple[list[object], dict[str, object]]] = [
+            ([1], {}) for _ in range(current_batch_size)
+        ]
+        batch_results: list[object] = _invoke_callable_batch_if_supported(
+            increment_method,
+            call_specs,
+        )
+        if len(batch_results) != current_batch_size:
+            raise ValueError("batch result length mismatch for increment")
+        for result_obj in batch_results:
+            final_value = _require_int(result_obj, "increment result")
+        completed += current_batch_size
     return {"final_value": final_value}
 
 
@@ -367,13 +426,27 @@ def _run_case_readline_digest(workload: object, iterations: int) -> dict[str, ob
         raise TypeError("workload.readline_history_digest must be callable")
     readline_method: Callable[[str, int, int], object] = readline_obj  # type: ignore[assignment]
 
+    batch_size: int = 64
+    completed: int = 0
     digest_accumulator: int = 0
-    for index in range(iterations):
-        digest_obj: object = readline_method("bench", index * 2, 24)
-        digest: str = _require_str(digest_obj, "readline_history_digest result")
-        digest_head: str = digest[0:16]
-        digest_piece: int = int(digest_head, 16)
-        digest_accumulator ^= digest_piece
+    while completed < iterations:
+        remaining: int = iterations - completed
+        current_batch_size: int = batch_size
+        if remaining < batch_size:
+            current_batch_size = remaining
+        call_specs: list[tuple[list[object], dict[str, object]]] = []
+        for offset in range(current_batch_size):
+            index: int = completed + offset
+            call_specs.append((["bench", index * 2, 24], {}))
+        batch_results: list[object] = _invoke_callable_batch_if_supported(readline_method, call_specs)
+        if len(batch_results) != current_batch_size:
+            raise ValueError("batch result length mismatch for readline_history_digest")
+        for digest_obj in batch_results:
+            digest: str = _require_str(digest_obj, "readline_history_digest result")
+            digest_head: str = digest[0:16]
+            digest_piece: int = int(digest_head, 16)
+            digest_accumulator ^= digest_piece
+        completed += current_batch_size
     return {"xor": digest_accumulator}
 
 

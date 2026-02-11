@@ -33,6 +33,7 @@ _BULK_PICKLE_MIN_ITEMS: int = 32
 TransportPolicy = Literal["value", "reference"]
 PolicySource = Literal["call_override", "type_rule", "session_default"]
 CALL_POLICY_KWARG: str = "__extradite_policy__"
+BatchCallSpec = tuple[list[object], dict[str, object]]
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -459,6 +460,24 @@ class _RemoteCallProxy:
             self._attr_name,
             list(args),
             kwargs,
+            call_policy=call_policy,
+        )
+
+    def batch(
+        self,
+        call_specs: list[BatchCallSpec],
+        call_policy: str | None = None,
+    ) -> list[object]:
+        """Invoke the wrapped remote callable for a batch of call specifications.
+
+        :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
+        :param call_policy: Optional per-call override applied to all encoded values.
+        :returns: Ordered decoded call results.
+        """
+        return self._session.call_attr_batch(
+            self._object_id,
+            self._attr_name,
+            call_specs,
             call_policy=call_policy,
         )
 
@@ -1772,6 +1791,94 @@ class ExtraditeSession:
 
         encoded_value: object = payload.get("value")
         return self._decode_from_child(encoded_value)
+
+    def _encode_batch_call_specs_for_child(
+        self,
+        call_specs: list[BatchCallSpec],
+        call_policy: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Encode one ordered batch-call specification list for child transport.
+
+        :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
+        :param call_policy: Optional per-call override.
+        :returns: Encoded call specification list.
+        :raises TypeError: If one call specification has invalid shape or key types.
+        """
+        encoded_calls: list[dict[str, object]] = []
+        for call_index, call_spec in enumerate(call_specs):
+            call_spec_is_tuple: bool = isinstance(call_spec, tuple)
+            if call_spec_is_tuple is False:
+                raise TypeError(f"call_specs[{call_index}] must be a tuple")
+            if len(call_spec) != 2:
+                raise TypeError(f"call_specs[{call_index}] must contain (args, kwargs)")
+
+            args_obj: object = call_spec[0]
+            kwargs_obj: object = call_spec[1]
+            if isinstance(args_obj, list) is False:
+                raise TypeError(f"call_specs[{call_index}] args must be a list")
+            if isinstance(kwargs_obj, dict) is False:
+                raise TypeError(f"call_specs[{call_index}] kwargs must be a dict")
+
+            encoded_args: list[object] = [
+                self._encode_for_child(item, call_policy=call_policy)
+                for item in args_obj
+            ]
+            encoded_kwargs: dict[str, object] = {}
+            for key_obj, value in kwargs_obj.items():
+                if isinstance(key_obj, str) is False:
+                    raise TypeError(f"call_specs[{call_index}] kwargs keys must be strings")
+                encoded_kwargs[key_obj] = self._encode_for_child(value, call_policy=call_policy)
+            encoded_calls.append({"args": encoded_args, "kwargs": encoded_kwargs})
+        return encoded_calls
+
+    def call_attr_batch(
+        self,
+        object_id: int,
+        attr_name: str,
+        call_specs: list[BatchCallSpec],
+        call_policy: str | None = None,
+    ) -> list[object]:
+        """Call one callable attribute repeatedly using one batched protocol request.
+
+        :param object_id: Remote object identifier.
+        :param attr_name: Callable attribute name.
+        :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
+        :param call_policy: Optional per-call override applied to all encoded values.
+        :returns: Ordered decoded result list.
+        :raises ExtraditeProtocolError: If response payload shape is invalid.
+        """
+        encoded_calls: list[dict[str, object]] = self._encode_batch_call_specs_for_child(
+            call_specs,
+            call_policy=call_policy,
+        )
+        response: dict[str, object] = self._send_request(
+            "call_attr_batch",
+            {
+                "object_id": object_id,
+                "attr_name": attr_name,
+                "calls": encoded_calls,
+            },
+        )
+
+        payload: object = response.get("payload")
+        if isinstance(payload, dict) is False:
+            raise ExtraditeProtocolError("call_attr_batch payload must be a dict")
+
+        encoded_values_obj: object = payload.get("values")
+        if isinstance(encoded_values_obj, list) is False:
+            raise ExtraditeProtocolError("call_attr_batch payload missing list values")
+
+        expected_length: int = len(call_specs)
+        result_length: int = len(encoded_values_obj)
+        if result_length != expected_length:
+            raise ExtraditeProtocolError(
+                f"call_attr_batch returned {result_length} values; expected {expected_length}"
+            )
+
+        decoded_values: list[object] = [
+            self._decode_from_child(item) for item in encoded_values_obj
+        ]
+        return decoded_values
 
     def set_attr(
         self,

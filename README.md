@@ -96,6 +96,27 @@ Proxy classes and instances expose:
 
 `get_effective_policy_trace` returns the chosen policy, source (`call_override`, `type_rule`, or `session_default`), and matched type name when applicable.
 
+### Batched method calls
+
+Callable proxy attributes expose a batch helper that collapses many calls into one protocol roundtrip:
+
+```python
+counter = RemoteCounter(0)
+results = counter.increment.batch(
+    [
+        ([1], {}),
+        ([2], {}),
+        ([3], {}),
+    ]
+)
+assert results == [1, 3, 6]
+```
+
+- each item is one `(args, kwargs)` pair;
+- batch execution preserves order;
+- batch calls short-circuit on the first raised remote exception;
+- optional `call_policy` is supported: `counter.echo.batch(calls, call_policy="value")`.
+
 ## Re-entrant callbacks
 
 The protocol is re-entrant: while one side is waiting on a response, it can service incoming nested requests from the other side.

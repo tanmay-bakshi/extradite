@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from collections.abc import Iterator
 
 import pytest
@@ -628,6 +629,120 @@ def test_invalid_transport_type_rules_fail_fast() -> None:
             TARGET,
             transport_type_rules={PicklablePayload: "bad-policy"},
         )
+
+
+def test_method_batch_calls_preserve_order_and_results() -> None:
+    """Batch method calls should preserve call order and returned values."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        increment_obj: object = counter.increment
+        increment_batch_obj: object = getattr(increment_obj, "batch")
+        increment_batch_is_callable: bool = callable(increment_batch_obj)
+        if increment_batch_is_callable is False:
+            raise TypeError("increment.batch must be callable")
+        increment_batch: Callable[[list[tuple[list[object], dict[str, object]]]], object] = increment_batch_obj  # type: ignore[assignment]
+
+        results_obj: object = increment_batch(
+            [
+                ([1], {}),
+                ([2], {}),
+                ([3], {}),
+            ]
+        )
+        assert isinstance(results_obj, list) is True
+        assert results_obj == [2, 4, 7]
+        assert counter.value == 7
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_method_batch_calls_short_circuit_on_first_error() -> None:
+    """Batch method calls should stop on first failing call and preserve prior state."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        increment_obj: object = counter.increment
+        increment_batch_obj: object = getattr(increment_obj, "batch")
+        increment_batch_is_callable: bool = callable(increment_batch_obj)
+        if increment_batch_is_callable is False:
+            raise TypeError("increment.batch must be callable")
+        increment_batch: Callable[[list[tuple[list[object], dict[str, object]]]], object] = increment_batch_obj  # type: ignore[assignment]
+
+        with pytest.raises(ExtraditeRemoteError) as exc_info:
+            increment_batch(
+                [
+                    ([1], {}),
+                    (["bad"], {}),
+                    ([1], {}),
+                ]
+            )
+        error_obj: ExtraditeRemoteError = exc_info.value
+        assert error_obj.remote_type_name == "TypeError"
+        assert counter.value == 2
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_method_batch_call_policy_override() -> None:
+    """Batch calls should honor explicit call-policy override semantics."""
+    counter_cls: type = extradite(
+        TARGET,
+        transport_policy="value",
+        transport_type_rules={PicklablePayload: "reference"},
+    )
+    counter = None
+    try:
+        counter = counter_cls(1)
+        echo_obj: object = counter.echo
+        echo_batch_obj: object = getattr(echo_obj, "batch")
+        echo_batch_is_callable: bool = callable(echo_batch_obj)
+        if echo_batch_is_callable is False:
+            raise TypeError("echo.batch must be callable")
+        echo_batch: Callable[[list[tuple[list[object], dict[str, object]]], str | None], object] = echo_batch_obj  # type: ignore[assignment]
+
+        first_payload = PicklablePayload(11)
+        second_payload = PicklablePayload(22)
+
+        default_results_obj: object = echo_batch(
+            [
+                ([first_payload], {}),
+                ([second_payload], {}),
+            ],
+            None,
+        )
+        assert isinstance(default_results_obj, list) is True
+        assert len(default_results_obj) == 2
+        assert default_results_obj[0] is first_payload
+        assert default_results_obj[1] is second_payload
+
+        override_results_obj: object = echo_batch(
+            [
+                ([first_payload], {}),
+                ([second_payload], {}),
+            ],
+            "value",
+        )
+        assert isinstance(override_results_obj, list) is True
+        assert len(override_results_obj) == 2
+        first_result_obj: object = override_results_obj[0]
+        second_result_obj: object = override_results_obj[1]
+        assert isinstance(first_result_obj, PicklablePayload) is True
+        assert isinstance(second_result_obj, PicklablePayload) is True
+        assert first_result_obj is not first_payload
+        assert second_result_obj is not second_payload
+        assert first_result_obj.value == first_payload.value
+        assert second_result_obj.value == second_payload.value
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
 
 
 def test_callback_roundtrip_reentrant() -> None:

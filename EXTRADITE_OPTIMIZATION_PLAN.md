@@ -2,7 +2,7 @@
 
 Last updated: 2026-02-11
 Owner: Codex + Tanmay
-Status: Phases 1-2 implemented; Phases 3-6 pending
+Status: Phases 1-3 implemented; Phases 4-6 pending
 
 ## Purpose
 
@@ -50,7 +50,7 @@ Baseline median results:
 | --- | --- | --- | --- |
 | 1 | Remove Per-Request Leak-Scan Overhead | Completed (2026-02-11) | `tiny_ping`, `increment_small`, `payload_small_checksum`, `readline_digest` |
 | 2 | Structured Payload Transport Fast-Path | Completed (2026-02-11) | `payload_large_sum`, `payload_small_checksum`, `mixed_pipeline` |
-| 3 | Batched RPC for Chatty Calls | Not Started | `tiny_ping`, `increment_small`, `readline_digest` |
+| 3 | Batched RPC for Chatty Calls | Completed (2026-02-11) | `tiny_ping`, `increment_small`, `readline_digest` |
 | 4 | Callback-Batch Bridge | Not Started | `callback_chatter` |
 | 5 | Shared-Memory Binary Transport | Not Started | `bytes_roundtrip_512kb`, large binary workloads |
 | 6 | Warm Session Lifecycle / Pooling | Not Started | `cold_start_first_call` |
@@ -206,6 +206,41 @@ Collapse many tiny parent->child calls into fewer protocol roundtrips.
 - New tests for order, return shape, and error behavior in batch execution.
 - Bench target:
   - `tiny_ping` and `increment_small` each improve by at least 2x versus baseline Extradite.
+
+### Implementation Notes (2026-02-11)
+
+- Added a new protocol action `call_attr_batch` in:
+  - `src/extradite/runtime.py`
+  - `src/extradite/worker.py`
+- Added a callable-proxy batch API:
+  - `counter.method.batch([(args, kwargs), ...], call_policy=...)`
+- Added deterministic tests for:
+  - ordered batch results;
+  - short-circuit behavior on first failing call;
+  - per-call policy override behavior in batch mode.
+- Updated benchmark regimes (`tiny_ping`, `increment_small`, `readline_digest`) to use the batch path when the callable exposes `.batch`, with loop fallback otherwise.
+
+### Phase 3 Result Snapshot (Targeted Regimes)
+
+Source runs:
+
+```bash
+PYTHONPATH=src python3 benchmarks/extradite_performance_benchmark.py --repetitions 5 --cases tiny_ping,increment_small,readline_digest --json-output /tmp/extradite-phase3-before.json
+PYTHONPATH=src python3 benchmarks/extradite_performance_benchmark.py --repetitions 5 --cases tiny_ping,increment_small,readline_digest --json-output /tmp/extradite-phase3-after.json
+```
+
+Extradite median `us/op` before vs after:
+
+| Regime | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `tiny_ping` | 25.713 | 2.742 | -89.34% |
+| `increment_small` | 28.909 | 4.029 | -86.06% |
+| `readline_digest` | 37.811 | 15.897 | -57.96% |
+
+Summary:
+
+- All targeted Phase 3 regimes improved substantially.
+- `tiny_ping` and `increment_small` each improved by far more than 2x, meeting the phase target.
 
 ---
 
