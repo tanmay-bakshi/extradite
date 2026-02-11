@@ -2,7 +2,7 @@
 
 Last updated: 2026-02-11
 Owner: Codex + Tanmay
-Status: Phases 1-4 implemented; Phases 5-6 pending
+Status: Phases 1-5 implemented; Phase 6 pending
 
 ## Purpose
 
@@ -52,7 +52,7 @@ Baseline median results:
 | 2 | Structured Payload Transport Fast-Path | Completed (2026-02-11) | `payload_large_sum`, `payload_small_checksum`, `mixed_pipeline` |
 | 3 | Batched RPC for Chatty Calls | Completed (2026-02-11) | `tiny_ping`, `increment_small`, `readline_digest` |
 | 4 | Callback-Batch Bridge | Completed (2026-02-11) | `callback_chatter` |
-| 5 | Shared-Memory Binary Transport | Not Started | `bytes_roundtrip_512kb`, large binary workloads |
+| 5 | Shared-Memory Binary Transport | Completed (2026-02-11) | `bytes_roundtrip_512kb`, large binary workloads |
 | 6 | Warm Session Lifecycle / Pooling | Not Started | `cold_start_first_call` |
 
 ## Phase 1: Remove Per-Request Leak-Scan Overhead
@@ -323,6 +323,43 @@ Reduce overhead for large binary payload transfers.
 - Bench target:
   - `bytes_roundtrip_512kb` median `us/op` improves by at least 25%.
 
+### Implementation Notes (2026-02-11)
+
+- Added thresholded shared-memory transport for large binary payloads (`bytes`/`bytearray`) in:
+  - `src/extradite/runtime.py`
+  - `src/extradite/worker.py`
+- Added decode/cleanup behavior that unlinks shared-memory blocks after read on the receiving side.
+- Added sender-side best-effort cleanup on request send failure and post-send cleanup.
+- Kept pipe/pickle transport as fallback for smaller payloads and non-binary values.
+- Added deterministic tests:
+  - `test_large_bytes_roundtrip_in_value_mode`
+  - `test_large_bytearray_roundtrip_in_value_mode`
+  - `test_shared_memory_cleanup_on_send_failure`
+  - `test_shared_memory_decode_unlinks_block`
+
+### Phase 5 Result Snapshot (Targeted Regimes)
+
+Source runs:
+
+```bash
+cd /tmp/extradite-phase5-before
+PYTHONPATH=src /Users/tanmaybakshi/extradite/.venv/bin/python benchmarks/extradite_performance_benchmark.py --repetitions 5 --cases bytes_roundtrip_512kb,mixed_pipeline --json-output /tmp/extradite-phase5-before.json
+cd /Users/tanmaybakshi/extradite
+PYTHONPATH=src .venv/bin/python benchmarks/extradite_performance_benchmark.py --repetitions 5 --cases bytes_roundtrip_512kb,mixed_pipeline --json-output /tmp/extradite-phase5-after.json
+```
+
+Extradite median `us/op` before vs after:
+
+| Regime | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `bytes_roundtrip_512kb` | 1002.676 | 349.686 | -65.12% |
+| `mixed_pipeline` | 2772.909 | 2746.350 | -0.96% |
+
+Summary:
+
+- `bytes_roundtrip_512kb` exceeded the phase target by a wide margin.
+- Guard regime `mixed_pipeline` remained effectively flat.
+
 ---
 
 ## Phase 6: Warm Session Lifecycle / Pooling
@@ -372,3 +409,4 @@ Amortize startup/teardown costs for workflows with repeated short-lived calls.
 
 - Created initial 6-phase optimization plan from benchmark + profiling evidence.
 - Recorded baseline metrics and phase-level success criteria.
+- Completed Phase 5 shared-memory binary transport and recorded benchmark deltas.

@@ -48,6 +48,8 @@ RemoteCounter.close() # stop child process
 - value mode: picklable values are transferred as serialized payloads;
 - reference mode: non-picklable values are transferred as opaque handles.
 
+In value mode, large binary payloads (`bytes`/`bytearray`) use a shared-memory fast path (currently thresholded at 64 KiB) to reduce IPC copy overhead while preserving value semantics.
+
 Handles are bi-directional:
 
 - parent -> child: local closures, function-local classes/instances, bound methods, and other non-picklable objects are passed by handle;

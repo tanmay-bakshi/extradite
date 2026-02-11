@@ -10,10 +10,12 @@ import time
 import traceback
 from collections.abc import Callable
 from collections.abc import Iterator
+from multiprocessing import shared_memory
 
 import pytest
 
 import extradite.runtime as runtime
+import extradite.worker as worker
 from extradite import ExtraditeModuleLeakError
 from extradite import ExtraditeProtocolError
 from extradite import ExtraditeRemoteError
@@ -403,6 +405,135 @@ def test_default_value_mode_copies_identity_as_documented() -> None:
         if counter is not None:
             counter.close()
         counter_cls.close()
+
+
+def test_large_bytes_roundtrip_in_value_mode() -> None:
+    """Large bytes payloads should roundtrip correctly in value mode."""
+    counter_cls: type = extradite(TARGET)
+    counter: object | None = None
+    try:
+        counter = counter_cls(1)
+        payload: bytes = b"z" * (256 * 1024)
+        returned_obj: object = counter.echo(payload)
+        assert isinstance(returned_obj, bytes) is True
+        assert returned_obj == payload
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_large_bytearray_roundtrip_in_value_mode() -> None:
+    """Large bytearray payloads should roundtrip correctly in value mode."""
+    counter_cls: type = extradite(TARGET)
+    counter: object | None = None
+    try:
+        counter = counter_cls(1)
+        chunk: bytearray = bytearray(range(256))
+        payload: bytearray = chunk * 1024
+        returned_obj: object = counter.echo(payload)
+        assert isinstance(returned_obj, bytearray) is True
+        assert returned_obj == payload
+        assert returned_obj is not payload
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_shared_memory_cleanup_on_send_failure() -> None:
+    """Shared-memory blocks created for outbound payloads should be cleaned on send failure."""
+
+    class _FailingConnection:
+        """Connection stub that always fails on ``send``."""
+
+        def send(self, message: object) -> None:
+            """Raise deterministic transport failure.
+
+            :param message: Message payload.
+            :raises BrokenPipeError: Always.
+            """
+            _ = message
+            raise BrokenPipeError("forced send failure")
+
+    session = runtime.ExtraditeSession()
+    session._connection = _FailingConnection()  # type: ignore[assignment]
+
+    shared_memory_names: list[str] = []
+    shared_payload_obj = runtime._create_shared_memory_payload(
+        b"x" * (256 * 1024),
+        shared_memory_names=shared_memory_names,
+    )
+    assert shared_payload_obj is not None
+    assert len(shared_memory_names) == 1
+    shared_memory_name: str = shared_memory_names[0]
+
+    with pytest.raises(ExtraditeProtocolError):
+        session._send_request(
+            "noop",
+            {},
+            outbound_shared_memory_names=shared_memory_names,
+        )
+
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=shared_memory_name)
+
+
+def test_shared_memory_decode_unlinks_block() -> None:
+    """Decoding shared-memory payloads should unlink the backing block."""
+    payload: bytes = b"a" * (128 * 1024)
+    block = shared_memory.SharedMemory(create=True, size=len(payload))
+    block_name: str = block.name
+    block.buf[0 : len(payload)] = payload
+    block.close()
+
+    session = runtime.ExtraditeSession()
+    decoded_obj: object = session._decode_from_child(
+        (runtime.WIRE_SHM_BYTES_TAG, block_name, len(payload), "bytes")
+    )
+    assert isinstance(decoded_obj, bytes) is True
+    assert decoded_obj == payload
+
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=block_name)
+
+
+def test_worker_shared_memory_cleanup_on_send_failure() -> None:
+    """Worker-side send failures should cleanup outbound shared-memory blocks."""
+
+    class _FailingConnection:
+        """Connection stub that always fails on ``send``."""
+
+        def send(self, message: object) -> None:
+            """Raise deterministic transport failure.
+
+            :param message: Message payload.
+            :raises BrokenPipeError: Always.
+            """
+            _ = message
+            raise BrokenPipeError("forced send failure")
+
+    failing_connection = _FailingConnection()
+    worker_runtime = worker.WorkerRuntime(failing_connection)  # type: ignore[arg-type]
+
+    shared_memory_names: list[str] = []
+    shared_payload_obj = worker._create_shared_memory_payload(
+        b"w" * (256 * 1024),
+        shared_memory_names=shared_memory_names,
+    )
+    assert shared_payload_obj is not None
+    assert len(shared_memory_names) == 1
+    shared_memory_name: str = shared_memory_names[0]
+
+    with pytest.raises(ExtraditeProtocolError):
+        worker_runtime._send_request_to_parent(
+            "noop",
+            {},
+            outbound_shared_memory_names=shared_memory_names,
+        )
+
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=shared_memory_name)
 
 
 def test_large_picklable_container_roundtrip_in_value_mode() -> None:

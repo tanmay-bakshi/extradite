@@ -9,6 +9,7 @@ import threading
 import traceback
 import weakref
 from collections.abc import Callable
+from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
 from typing import Any
 from typing import ClassVar
@@ -22,6 +23,7 @@ from extradite.worker import OWNER_CHILD
 from extradite.worker import OWNER_PARENT
 from extradite.worker import WIRE_PICKLE_TAG
 from extradite.worker import WIRE_REF_TAG
+from extradite.worker import WIRE_SHM_BYTES_TAG
 from extradite.worker import worker_entry
 
 _SHARED_SESSION_LOCK: threading.RLock = threading.RLock()
@@ -30,6 +32,9 @@ _IMPORT_HOOK_LOCK: threading.Lock = threading.Lock()
 _IMPORT_HOOK_INSTALLED: bool = False
 _IMPORT_EPOCH: int = 0
 _BULK_PICKLE_MIN_ITEMS: int = 32
+_SHARED_MEMORY_MIN_BYTES: int = 64 * 1024
+_SHARED_MEMORY_BYTES_KIND: str = "bytes"
+_SHARED_MEMORY_BYTEARRAY_KIND: str = "bytearray"
 TransportPolicy = Literal["value", "reference"]
 PolicySource = Literal["call_override", "type_rule", "session_default"]
 CALL_POLICY_KWARG: str = "__extradite_policy__"
@@ -113,6 +118,129 @@ def _try_pickle_payload(value: object) -> bytes | None:
         return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
     except (pickle.PicklingError, TypeError, AttributeError, ValueError):
         return None
+
+
+def _create_shared_memory_payload(
+    value: object,
+    shared_memory_names: list[str] | None = None,
+) -> tuple[str, str, int, str] | None:
+    """Create shared-memory wire payload for large ``bytes``/``bytearray`` values.
+
+    :param value: Candidate runtime value.
+    :param shared_memory_names: Optional list that collects created shared-memory names.
+    :returns: Shared-memory wire tuple, or ``None`` when value is not eligible.
+    :raises ExtraditeProtocolError: If shared-memory allocation or writes fail.
+    """
+    value_kind: str
+    value_bytes: bytes
+    if isinstance(value, bytes) is True:
+        value_kind = _SHARED_MEMORY_BYTES_KIND
+        value_bytes = value
+    elif isinstance(value, bytearray) is True:
+        value_kind = _SHARED_MEMORY_BYTEARRAY_KIND
+        value_bytes = bytes(value)
+    else:
+        return None
+
+    payload_length: int = len(value_bytes)
+    if payload_length < _SHARED_MEMORY_MIN_BYTES:
+        return None
+
+    try:
+        block = shared_memory.SharedMemory(create=True, size=payload_length)
+    except OSError as exc:
+        raise ExtraditeProtocolError("Failed to allocate shared memory payload") from exc
+
+    block_name: str = block.name
+    try:
+        try:
+            block.buf[0:payload_length] = value_bytes
+        except (BufferError, TypeError, ValueError) as exc:
+            raise ExtraditeProtocolError("Failed to write shared memory payload") from exc
+    except ExtraditeProtocolError:
+        block.close()
+        try:
+            block.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+    block.close()
+    if shared_memory_names is not None:
+        shared_memory_names.append(block_name)
+    return (WIRE_SHM_BYTES_TAG, block_name, payload_length, value_kind)
+
+
+def _cleanup_shared_memory_names(shared_memory_names: list[str]) -> None:
+    """Best-effort cleanup for shared-memory blocks by name.
+
+    :param shared_memory_names: Shared-memory names created by this process.
+    """
+    for shared_memory_name in shared_memory_names:
+        try:
+            block = shared_memory.SharedMemory(name=shared_memory_name)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        block.close()
+        try:
+            block.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def _decode_shared_memory_payload(value: tuple[object, object, object, object]) -> object:
+    """Decode shared-memory wire payload into ``bytes`` or ``bytearray``.
+
+    :param value: Shared-memory wire payload tuple.
+    :returns: Decoded runtime value.
+    :raises ExtraditeProtocolError: If payload is malformed or cannot be read.
+    """
+    _, shared_memory_name_obj, payload_length_obj, value_kind_obj = value
+    if isinstance(shared_memory_name_obj, str) is False:
+        raise ExtraditeProtocolError("Shared-memory payload name must be str")
+    if isinstance(payload_length_obj, int) is False:
+        raise ExtraditeProtocolError("Shared-memory payload length must be int")
+    if isinstance(value_kind_obj, str) is False:
+        raise ExtraditeProtocolError("Shared-memory payload kind must be str")
+
+    payload_length: int = payload_length_obj
+    if payload_length < 0:
+        raise ExtraditeProtocolError("Shared-memory payload length must be >= 0")
+
+    value_kind: str = value_kind_obj
+    known_kind: bool = (
+        value_kind == _SHARED_MEMORY_BYTES_KIND
+        or value_kind == _SHARED_MEMORY_BYTEARRAY_KIND
+    )
+    if known_kind is False:
+        raise ExtraditeProtocolError(f"Unknown shared-memory payload kind: {value_kind!r}")
+
+    try:
+        block = shared_memory.SharedMemory(name=shared_memory_name_obj)
+    except FileNotFoundError as exc:
+        raise ExtraditeProtocolError("Shared-memory payload block is missing") from exc
+    except OSError as exc:
+        raise ExtraditeProtocolError("Failed to open shared-memory payload block") from exc
+
+    try:
+        available_length: int = len(block.buf)
+        if payload_length > available_length:
+            raise ExtraditeProtocolError(
+                "Shared-memory payload length exceeds allocated block size"
+            )
+        payload_bytes: bytes = bytes(block.buf[0:payload_length])
+    finally:
+        block.close()
+        try:
+            block.unlink()
+        except FileNotFoundError:
+            pass
+
+    if value_kind == _SHARED_MEMORY_BYTES_KIND:
+        return payload_bytes
+    return bytearray(payload_bytes)
 
 
 def _parse_target(target: str) -> tuple[str, str]:
@@ -1191,6 +1319,10 @@ class ExtraditeSession:
                     if isinstance(payload_obj, bytes) is False:
                         raise ExtraditeProtocolError("Encoded pickle payload must be bytes")
                     return _safe_unpickle(payload_obj, self._protected_module_names)
+            if tuple_length == 4:
+                tag_obj = value[0]
+                if tag_obj == WIRE_SHM_BYTES_TAG:
+                    return _decode_shared_memory_payload(value)
             if tuple_length == 3:
                 tag_obj = value[0]
                 owner_obj: object = value[1]
@@ -1332,11 +1464,17 @@ class ExtraditeSession:
             return False
         return True
 
-    def _encode_for_child(self, value: object, call_policy: str | None = None) -> object:
+    def _encode_for_child(
+        self,
+        value: object,
+        call_policy: str | None = None,
+        shared_memory_names: list[str] | None = None,
+    ) -> object:
         """Encode one runtime value for transport to the child.
 
         :param value: Runtime value.
         :param call_policy: Optional per-call override.
+        :param shared_memory_names: Optional shared-memory name collector.
         :returns: Wire value.
         :raises UnsupportedInteractionError: If transfer cannot be performed safely.
         """
@@ -1373,6 +1511,15 @@ class ExtraditeSession:
             object_id_force_ref: int = self._local_object_registry.store(value)
             return (WIRE_REF_TAG, OWNER_PARENT, object_id_force_ref)
 
+        use_shared_memory: bool = effective_policy == "value"
+        if use_shared_memory is True:
+            shared_memory_payload = _create_shared_memory_payload(
+                value,
+                shared_memory_names=shared_memory_names,
+            )
+            if shared_memory_payload is not None:
+                return shared_memory_payload
+
         is_container_candidate: bool = _is_bulk_pickle_container_candidate(value)
         if is_container_candidate is True:
             should_try_bulk_pickle: bool = self._should_try_bulk_pickle_for_child(
@@ -1386,34 +1533,64 @@ class ExtraditeSession:
                     return (WIRE_PICKLE_TAG, bulk_payload)
 
         if isinstance(value, list) is True:
-            return [self._encode_for_child(item, call_policy=call_policy) for item in value]
+            return [
+                self._encode_for_child(
+                    item,
+                    call_policy=call_policy,
+                    shared_memory_names=shared_memory_names,
+                )
+                for item in value
+            ]
 
         if isinstance(value, tuple) is True:
-            return tuple(self._encode_for_child(item, call_policy=call_policy) for item in value)
+            return tuple(
+                self._encode_for_child(
+                    item,
+                    call_policy=call_policy,
+                    shared_memory_names=shared_memory_names,
+                )
+                for item in value
+            )
 
         if isinstance(value, set) is True:
             encoded_items: set[object] = set()
             for item in value:
-                encoded_item: object = self._encode_for_child(item, call_policy=call_policy)
+                encoded_item: object = self._encode_for_child(
+                    item,
+                    call_policy=call_policy,
+                    shared_memory_names=shared_memory_names,
+                )
                 encoded_items.add(encoded_item)
             return encoded_items
 
         if isinstance(value, frozenset) is True:
             encoded_frozen_items: set[object] = set()
             for item in value:
-                encoded_item = self._encode_for_child(item, call_policy=call_policy)
+                encoded_item = self._encode_for_child(
+                    item,
+                    call_policy=call_policy,
+                    shared_memory_names=shared_memory_names,
+                )
                 encoded_frozen_items.add(encoded_item)
             return frozenset(encoded_frozen_items)
 
         if isinstance(value, dict) is True:
             encoded_dict: dict[object, object] = {}
             for key, item in value.items():
-                encoded_key: object = self._encode_for_child(key, call_policy=call_policy)
+                encoded_key: object = self._encode_for_child(
+                    key,
+                    call_policy=call_policy,
+                    shared_memory_names=shared_memory_names,
+                )
                 try:
                     hash(encoded_key)
                 except TypeError as exc:
                     raise UnsupportedInteractionError("Encoded dict keys must stay hashable") from exc
-                encoded_item: object = self._encode_for_child(item, call_policy=call_policy)
+                encoded_item: object = self._encode_for_child(
+                    item,
+                    call_policy=call_policy,
+                    shared_memory_names=shared_memory_names,
+                )
                 encoded_dict[encoded_key] = encoded_item
             return encoded_dict
 
@@ -1707,32 +1884,42 @@ class ExtraditeSession:
 
             raise ExtraditeProtocolError("Child message must include either status or action")
 
-    def _send_request(self, action: str, payload: dict[str, object]) -> dict[str, object]:
+    def _send_request(
+        self,
+        action: str,
+        payload: dict[str, object],
+        outbound_shared_memory_names: list[str] | None = None,
+    ) -> dict[str, object]:
         """Send one request and return its decoded top-level response.
 
         :param action: Action name.
         :param payload: Action payload.
+        :param outbound_shared_memory_names: Optional shared-memory names to cleanup.
         :returns: Response dictionary.
         """
-        with self._lock:
-            self._assert_protected_modules_not_loaded()
-            connection: Connection = self._require_connection()
+        try:
+            with self._lock:
+                self._assert_protected_modules_not_loaded()
+                connection: Connection = self._require_connection()
 
-            request_id: int = self._next_request_id
-            self._next_request_id += 1
+                request_id: int = self._next_request_id
+                self._next_request_id += 1
 
-            request: dict[str, object] = {
-                "request_id": request_id,
-                "action": action,
-            }
-            request.update(payload)
+                request: dict[str, object] = {
+                    "request_id": request_id,
+                    "action": action,
+                }
+                request.update(payload)
 
-            try:
-                connection.send(request)
-            except (BrokenPipeError, EOFError, OSError) as exc:
-                raise ExtraditeProtocolError("Failed to send request to child process") from exc
+                try:
+                    connection.send(request)
+                except (BrokenPipeError, EOFError, OSError) as exc:
+                    raise ExtraditeProtocolError("Failed to send request to child process") from exc
 
-            return self._wait_for_response(expected_request_id=request_id)
+                return self._wait_for_response(expected_request_id=request_id)
+        finally:
+            if outbound_shared_memory_names is not None:
+                _cleanup_shared_memory_names(outbound_shared_memory_names)
 
     def construct_instance(
         self,
@@ -1749,13 +1936,22 @@ class ExtraditeSession:
         :param call_policy: Optional per-call override.
         :returns: Remote object identifier.
         """
+        shared_memory_names: list[str] = []
         encoded_args: list[object] = [
-            self._encode_for_child(item, call_policy=call_policy)
+            self._encode_for_child(
+                item,
+                call_policy=call_policy,
+                shared_memory_names=shared_memory_names,
+            )
             for item in args
         ]
         encoded_kwargs: dict[str, object] = {}
         for key, value in kwargs.items():
-            encoded_kwargs[key] = self._encode_for_child(value, call_policy=call_policy)
+            encoded_kwargs[key] = self._encode_for_child(
+                value,
+                call_policy=call_policy,
+                shared_memory_names=shared_memory_names,
+            )
 
         response: dict[str, object] = self._send_request(
             "construct",
@@ -1764,6 +1960,7 @@ class ExtraditeSession:
                 "args": encoded_args,
                 "kwargs": encoded_kwargs,
             },
+            outbound_shared_memory_names=shared_memory_names,
         )
 
         payload: object = response.get("payload")
@@ -1820,13 +2017,22 @@ class ExtraditeSession:
         :param call_policy: Optional per-call override.
         :returns: Decoded call result.
         """
+        shared_memory_names: list[str] = []
         encoded_args: list[object] = [
-            self._encode_for_child(item, call_policy=call_policy)
+            self._encode_for_child(
+                item,
+                call_policy=call_policy,
+                shared_memory_names=shared_memory_names,
+            )
             for item in args
         ]
         encoded_kwargs: dict[str, object] = {}
         for key, value in kwargs.items():
-            encoded_kwargs[key] = self._encode_for_child(value, call_policy=call_policy)
+            encoded_kwargs[key] = self._encode_for_child(
+                value,
+                call_policy=call_policy,
+                shared_memory_names=shared_memory_names,
+            )
 
         response: dict[str, object] = self._send_request(
             "call_attr",
@@ -1836,6 +2042,7 @@ class ExtraditeSession:
                 "args": encoded_args,
                 "kwargs": encoded_kwargs,
             },
+            outbound_shared_memory_names=shared_memory_names,
         )
 
         payload: object = response.get("payload")
@@ -1849,11 +2056,13 @@ class ExtraditeSession:
         self,
         call_specs: list[BatchCallSpec],
         call_policy: str | None = None,
+        shared_memory_names: list[str] | None = None,
     ) -> list[dict[str, object]]:
         """Encode one ordered batch-call specification list for child transport.
 
         :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
         :param call_policy: Optional per-call override.
+        :param shared_memory_names: Optional shared-memory name collector.
         :returns: Encoded call specification list.
         :raises TypeError: If one call specification has invalid shape or key types.
         """
@@ -1873,14 +2082,22 @@ class ExtraditeSession:
                 raise TypeError(f"call_specs[{call_index}] kwargs must be a dict")
 
             encoded_args: list[object] = [
-                self._encode_for_child(item, call_policy=call_policy)
+                self._encode_for_child(
+                    item,
+                    call_policy=call_policy,
+                    shared_memory_names=shared_memory_names,
+                )
                 for item in args_obj
             ]
             encoded_kwargs: dict[str, object] = {}
             for key_obj, value in kwargs_obj.items():
                 if isinstance(key_obj, str) is False:
                     raise TypeError(f"call_specs[{call_index}] kwargs keys must be strings")
-                encoded_kwargs[key_obj] = self._encode_for_child(value, call_policy=call_policy)
+                encoded_kwargs[key_obj] = self._encode_for_child(
+                    value,
+                    call_policy=call_policy,
+                    shared_memory_names=shared_memory_names,
+                )
             encoded_calls.append({"args": encoded_args, "kwargs": encoded_kwargs})
         return encoded_calls
 
@@ -1900,9 +2117,11 @@ class ExtraditeSession:
         :returns: Ordered decoded result list.
         :raises ExtraditeProtocolError: If response payload shape is invalid.
         """
+        shared_memory_names: list[str] = []
         encoded_calls: list[dict[str, object]] = self._encode_batch_call_specs_for_child(
             call_specs,
             call_policy=call_policy,
+            shared_memory_names=shared_memory_names,
         )
         response: dict[str, object] = self._send_request(
             "call_attr_batch",
@@ -1911,6 +2130,7 @@ class ExtraditeSession:
                 "attr_name": attr_name,
                 "calls": encoded_calls,
             },
+            outbound_shared_memory_names=shared_memory_names,
         )
 
         payload: object = response.get("payload")
@@ -1947,7 +2167,12 @@ class ExtraditeSession:
         :param value: New value.
         :param call_policy: Optional per-call override.
         """
-        encoded_value: object = self._encode_for_child(value, call_policy=call_policy)
+        shared_memory_names: list[str] = []
+        encoded_value: object = self._encode_for_child(
+            value,
+            call_policy=call_policy,
+            shared_memory_names=shared_memory_names,
+        )
         self._send_request(
             "set_attr",
             {
@@ -1955,6 +2180,7 @@ class ExtraditeSession:
                 "attr_name": attr_name,
                 "value": encoded_value,
             },
+            outbound_shared_memory_names=shared_memory_names,
         )
 
     def del_attr(self, object_id: int, attr_name: str) -> None:
