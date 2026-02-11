@@ -27,6 +27,27 @@ PEER_TARGET: str = f"{PEER_MODULE}:{PEER_CLASS}"
 _INTERPRETER_POOL_EXECUTOR: object = getattr(concurrent.futures, "InterpreterPoolExecutor", None)
 
 
+class PicklablePayload:
+    """Top-level picklable payload used for value-mode identity tests."""
+
+    value: int
+
+    def __init__(self, value: int) -> None:
+        """Initialize payload.
+
+        :param value: Stored value.
+        """
+        self.value = value
+
+
+class BaseLocalClass:
+    """Base class used for class-handle semantics tests."""
+
+
+class DerivedLocalClass(BaseLocalClass):
+    """Derived class used for class-handle semantics tests."""
+
+
 def _purge_module(module_name: str) -> None:
     """Remove a module tree from ``sys.modules``.
 
@@ -214,6 +235,114 @@ def test_non_picklable_argument_as_handle() -> None:
         counter_cls.close()
 
 
+def test_parent_class_handle_repr_behaves_like_type() -> None:
+    """Verify ``repr`` behavior for parent-origin class handles."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        expected_repr: str = repr(BaseLocalClass)
+        remote_repr: object = counter.class_handle_repr(BaseLocalClass)
+        assert remote_repr == expected_repr
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_parent_class_handle_isinstance_semantics() -> None:
+    """Verify ``isinstance`` semantics for parent-origin class handles."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        value = DerivedLocalClass()
+        result: object = counter.class_handle_isinstance(value, BaseLocalClass)
+        assert result is True
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_parent_class_handle_issubclass_semantics() -> None:
+    """Verify ``issubclass`` semantics for parent-origin class handles."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        result: object = counter.class_handle_issubclass(DerivedLocalClass, BaseLocalClass)
+        assert result is True
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_parent_handle_roundtrip_returns_same_object_without_release_error() -> None:
+    """Roundtripping a parent-origin non-picklable handle should preserve identity."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        lock_object = threading.Lock()
+        roundtripped: object = counter.echo(lock_object)
+        assert roundtripped is lock_object
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_transport_policy_force_reference_preserves_identity() -> None:
+    """Policy ``reference`` should preserve identity for picklable user objects."""
+    counter_cls: type = extradite(TARGET, transport_policy="reference")
+    counter = None
+    try:
+        counter = counter_cls(1)
+        payload = PicklablePayload(21)
+        returned: object = counter.echo(payload)
+        assert returned is payload
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_default_value_mode_copies_identity_as_documented() -> None:
+    """Default policy should transfer picklable user objects by value."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        payload = PicklablePayload(99)
+        returned: object = counter.echo(payload)
+        assert returned is not payload
+        assert isinstance(returned, PicklablePayload) is True
+        assert returned.value == payload.value
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_invalid_transport_policy_fails_fast() -> None:
+    """Invalid transport policy configuration should fail fast in the caller."""
+    with pytest.raises(ValueError, match="transport_policy"):
+        extradite(TARGET, transport_policy="invalid-policy")
+
+
+def test_share_key_rejects_conflicting_transport_policy() -> None:
+    """A shared session key must not mix conflicting transport policies."""
+    share_key: str = "policy-conflict"
+    counter_cls: type = extradite(TARGET, share_key=share_key, transport_policy="value")
+    try:
+        with pytest.raises(ValueError, match="share_key already exists"):
+            extradite(TARGET, share_key=share_key, transport_policy="reference")
+    finally:
+        counter_cls.close()
+
+
 def test_callback_roundtrip_reentrant() -> None:
     """Ensure callback success and failure paths propagate through re-entrant RPC."""
     counter_cls: type = extradite(TARGET)
@@ -385,11 +514,29 @@ def test_protected_module_leak_block() -> None:
         counter_cls.close()
 
 
-def test_module_leak_detection_blocks_new_session() -> None:
-    """Verify that a local import leak blocks session startup."""
+def test_protected_module_import_before_bootstrap_fails_fast() -> None:
+    """Importing the protected module before bootstrap must fail fast."""
     importlib.import_module(TARGET_MODULE)
     with pytest.raises(ExtraditeModuleLeakError):
         extradite(TARGET)
+
+
+def test_bootstrap_path_never_imports_protected_module_in_root() -> None:
+    """Bootstrapping and using proxies should not import protected modules in root."""
+    module_loaded_before: bool = TARGET_MODULE in sys.modules
+    assert module_loaded_before is False
+
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(3)
+        counter.increment(2)
+        module_loaded_after: bool = TARGET_MODULE in sys.modules
+        assert module_loaded_after is False
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
 
 
 def test_share_key_reuses_session_for_same_target() -> None:

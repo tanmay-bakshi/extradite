@@ -79,6 +79,40 @@ class IsolatedCounter:
             raise TypeError("callback must return int")
         return result
 
+    def echo(self, value: object) -> object:
+        """Return one value unchanged.
+
+        :param value: Input value.
+        :returns: The same value.
+        """
+        return value
+
+    def class_handle_repr(self, class_handle: object) -> str:
+        """Return ``repr`` for a class handle.
+
+        :param class_handle: Class-like object.
+        :returns: Representation string.
+        """
+        return repr(class_handle)
+
+    def class_handle_isinstance(self, value: object, class_handle: object) -> bool:
+        """Evaluate ``isinstance`` with a parent-origin class handle.
+
+        :param value: Candidate instance.
+        :param class_handle: Class-like object.
+        :returns: ``True`` when ``value`` is an instance of ``class_handle``.
+        """
+        return isinstance(value, class_handle)  # type: ignore[arg-type]
+
+    def class_handle_issubclass(self, subclass: object, class_handle: object) -> bool:
+        """Evaluate ``issubclass`` with a parent-origin class handle.
+
+        :param subclass: Candidate subclass.
+        :param class_handle: Class-like object.
+        :returns: ``True`` when ``subclass`` is a subclass of ``class_handle``.
+        """
+        return issubclass(subclass, class_handle)  # type: ignore[arg-type]
+
     def inspect_marker(self, payload: object) -> str:
         """Read ``payload.marker`` and return it as a string.
 

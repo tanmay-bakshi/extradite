@@ -67,10 +67,13 @@ This prevents protected-module leakage through marshal/unmarshal transfer paths.
 
 ## API
 
-### `extradite(target: str, share_key: str | None = None) -> type`
+### `extradite(target: str, share_key: str | None = None, transport_policy: str = "value") -> type`
 
 - `target` format: `"module.path:ClassName"`.
 - `share_key` is optional; when provided, calls with the same key reuse one backing child process.
+- `transport_policy` controls picklable-value transport behavior:
+  - `"value"` (default): transfer picklable values by copy.
+  - `"reference"`: force handle transport for non-scalar values, preserving identity.
 - returns a dynamic proxy class.
 - constructing that proxy creates remote instances in the child process.
 - default behavior is unchanged: without `share_key`, each call gets its own child process.
@@ -84,6 +87,23 @@ This enables callback chains such as:
 - caller -> isolated method -> caller callback -> isolated method.
 
 Nested request routing is handled in-process and avoids deadlock in supported interaction patterns.
+
+## Type and Handle Semantics
+
+Parent-origin class handles preserve core type-style behavior in the isolated side for supported operations:
+
+- `repr(class_handle)`
+- `isinstance(value, class_handle)`
+- `issubclass(subclass, class_handle)`
+
+Parent-handle roundtrips are also stable: passing a parent object by handle and returning it back preserves identity without spurious released-handle errors.
+
+## Identity Semantics
+
+Identity behavior for picklable values depends on `transport_policy`:
+
+- `"value"` mode copies values (`echo(obj) is obj` is typically `False`).
+- `"reference"` mode forces handle transport for non-scalar values (`echo(obj) is obj` can be `True`).
 
 ## Exceptions
 
@@ -106,6 +126,7 @@ These preserve the original remote exception type, message, and traceback text.
 - Passing proxy objects between different proxy sessions is disallowed.
 - Some advanced Python interactions may be unsupported and raise `UnsupportedInteractionError`.
 - If you use `share_key`, `Class.close()` releases that class handle; the shared child process exits when the last handle for that key is closed.
+- If you reuse a `share_key`, all calls must use the same `transport_policy`.
 - Handle proxies support explicit `close()` and deterministic use-after-release protocol errors.
 
 ## Running tests
