@@ -338,6 +338,24 @@ def test_parent_class_handle_schema_like_payload_accepts_real_type() -> None:
         counter_cls.close()
 
 
+def test_parent_class_handle_hasattr_missing_attribute_is_safe() -> None:
+    """Missing attributes on class handles should surface as ``AttributeError`` semantics."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+
+        class LocalWithoutSlots:
+            """Class without ``__slots__`` to exercise ``hasattr`` behavior."""
+
+        result: object = counter.class_handle_missing_attribute_uses_attribute_error(LocalWithoutSlots)
+        assert result is False
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
 def test_parent_handle_roundtrip_returns_same_object_without_release_error() -> None:
     """Roundtripping a parent-origin non-picklable handle should preserve identity."""
     counter_cls: type = extradite(TARGET)

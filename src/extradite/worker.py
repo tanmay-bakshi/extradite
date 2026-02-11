@@ -171,6 +171,16 @@ def _extract_parent_type_proxy_object_id(value: object) -> int | None:
     return object_id_obj
 
 
+def _extract_parent_type_proxy_instance_class_id(value: object) -> int | None:
+    """Return parent class object id when ``value`` is a parent type-proxy instance.
+
+    :param value: Candidate value.
+    :returns: Parent class object identifier or ``None``.
+    """
+    value_type: type[object] = type(value)
+    return _extract_parent_type_proxy_object_id(value_type)
+
+
 class ObjectRegistry:
     """Store worker-side objects under stable integer identifiers."""
 
@@ -602,7 +612,7 @@ class _ParentRemoteHandle:
 
         :returns: Parent-owned object identifier.
         """
-        return self._remote_object_id
+        return object.__getattribute__(self, "_remote_object_id")
 
     def close(self) -> None:
         """Release this parent-owned handle."""
@@ -618,6 +628,9 @@ class _ParentRemoteHandle:
         :param attr_name: Attribute name.
         :returns: Remote attribute value or call proxy.
         """
+        is_internal: bool = attr_name.startswith("_")
+        if is_internal is True:
+            raise AttributeError(attr_name)
         return self._runtime.get_parent_attr(self._remote_object_id, attr_name)
 
     def __setattr__(self, attr_name: str, value: object) -> None:
@@ -1074,6 +1087,35 @@ class WorkerRuntime:
 
         return value
 
+    def _materialize_parent_instance_from_type_proxy(
+        self,
+        value: object,
+        class_object_id: int,
+    ) -> _ParentRemoteHandle:
+        """Build a parent-origin instance from one child-local type-proxy instance.
+
+        :param value: Child-local instance created from a parent type proxy.
+        :param class_object_id: Parent class object identifier.
+        :returns: Parent-origin instance handle.
+        :raises ExtraditeProtocolError: If parent instance construction fails.
+        :raises UnsupportedInteractionError: If instance state cannot be transferred.
+        """
+        class_proxy: object = type(value)
+        created_obj: object = self.call_parent_attr(class_object_id, "__new__", [class_proxy], {})
+        if isinstance(created_obj, _ParentRemoteHandle) is False:
+            raise ExtraditeProtocolError("Parent __new__ did not produce a parent handle")
+        parent_instance: _ParentRemoteHandle = created_obj
+
+        instance_dict_obj: object = getattr(value, "__dict__", None)
+        if isinstance(instance_dict_obj, dict) is False:
+            return parent_instance
+
+        for key, item in instance_dict_obj.items():
+            if isinstance(key, str) is False:
+                raise UnsupportedInteractionError("Type-proxy instance dict keys must be strings")
+            setattr(parent_instance, key, item)
+        return parent_instance
+
     def _encode_for_parent(self, value: object) -> object:
         """Encode one runtime value for transport to the parent.
 
@@ -1086,6 +1128,13 @@ class WorkerRuntime:
         parent_type_proxy_object_id: int | None = _extract_parent_type_proxy_object_id(value)
         if parent_type_proxy_object_id is not None:
             return (WIRE_REF_TAG, OWNER_PARENT, parent_type_proxy_object_id)
+        parent_type_proxy_class_id: int | None = _extract_parent_type_proxy_instance_class_id(value)
+        if parent_type_proxy_class_id is not None:
+            parent_instance: _ParentRemoteHandle = self._materialize_parent_instance_from_type_proxy(
+                value,
+                parent_type_proxy_class_id,
+            )
+            return (WIRE_REF_TAG, OWNER_PARENT, parent_instance.remote_object_id)
 
         seen_ids: set[int] = set()
         contains_protected: bool = _value_originates_from_module(value, self._protected_module_names, seen_ids)
@@ -1417,6 +1466,9 @@ class WorkerRuntime:
                 remote_traceback: str = ""
                 if isinstance(traceback_obj, str) is True:
                     remote_traceback = traceback_obj
+
+                if error_type == "AttributeError":
+                    raise AttributeError(error_message)
 
                 raise _RemotePeerError(error_type, error_message, remote_traceback)
 

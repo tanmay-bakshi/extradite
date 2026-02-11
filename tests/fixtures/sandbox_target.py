@@ -138,6 +138,14 @@ class IsolatedCounter:
         _ = type("DerivedFromSchema", (class_handle,), {})  # type: ignore[arg-type]
         return class_handle(**kwargs_obj)  # type: ignore[arg-type,operator]
 
+    def class_handle_missing_attribute_uses_attribute_error(self, class_handle: object) -> bool:
+        """Evaluate ``hasattr`` against parent-origin class handles.
+
+        :param class_handle: Candidate class handle.
+        :returns: Result of ``hasattr(class_handle, "__slots__")``.
+        """
+        return hasattr(class_handle, "__slots__")
+
     def inspect_marker(self, payload: object) -> str:
         """Read ``payload.marker`` and return it as a string.
 
