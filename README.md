@@ -41,16 +41,29 @@ counter.close()       # release remote instance
 RemoteCounter.close() # stop child process
 ```
 
-## Serialization contract
+## Transport contract
 
-`extradite` uses pickled payloads over IPC. Two categories are explicitly rejected:
+`extradite` supports two transport modes for arguments and return values:
 
-- unpicklable return values;
-- return values that originate from the isolated module tree.
+- value mode: picklable values are transferred as serialized payloads;
+- reference mode: non-picklable values are transferred as opaque handles.
 
-When either happens, an exception is raised and the value is not transferred to the root process.
+Handles are bi-directional:
 
-This is intentional and enforces a hard barrier so the root process never imports classes/functions from the isolated module.
+- parent -> child: local closures, function-local classes/instances, bound methods, and other non-picklable objects are passed by handle;
+- child -> parent: non-picklable values that do not violate isolation are returned by handle.
+
+Handle identity is preserved per session. Passing the same object repeatedly yields the same remote handle identity.
+
+## Isolation contract
+
+`extradite` enforces strict module isolation:
+
+- the target module tree must never be loaded in the root interpreter;
+- the root process refuses to start a target if that module tree is already present in `sys.modules`;
+- child->parent value-mode transfers are blocked if they originate from the protected module tree.
+
+This prevents protected-module leakage through marshal/unmarshal transfer paths.
 
 ## API
 
@@ -62,12 +75,38 @@ This is intentional and enforces a hard barrier so the root process never import
 - constructing that proxy creates remote instances in the child process.
 - default behavior is unchanged: without `share_key`, each call gets its own child process.
 
+## Re-entrant callbacks
+
+The protocol is re-entrant: while one side is waiting on a response, it can service incoming nested requests from the other side.
+
+This enables callback chains such as:
+
+- caller -> isolated method -> caller callback -> isolated method.
+
+Nested request routing is handled in-process and avoids deadlock in supported interaction patterns.
+
+## Exceptions
+
+Remote exceptions are propagated with stable local wrappers:
+
+- known protocol/isolation exceptions map to local `ExtraditeProtocolError`, `ExtraditeModuleLeakError`, and `UnsupportedInteractionError`;
+- unknown remote exceptions map to `ExtraditeRemoteError`.
+
+`ExtraditeRemoteError` exposes fidelity fields:
+
+- `remote_type_name`
+- `remote_message`
+- `remote_traceback`
+
+These preserve the original remote exception type, message, and traceback text.
+
 ## Constraints and caveats
 
 - The target module must not be imported in the root process before creating the proxy.
-- Passing objects between different proxy sessions is disallowed.
+- Passing proxy objects between different proxy sessions is disallowed.
 - Some advanced Python interactions may be unsupported and raise `UnsupportedInteractionError`.
 - If you use `share_key`, `Class.close()` releases that class handle; the shared child process exits when the last handle for that key is closed.
+- Handle proxies support explicit `close()` and deterministic use-after-release protocol errors.
 
 ## Running tests
 

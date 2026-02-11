@@ -1,6 +1,8 @@
 """Target module imported only in extradite child processes during tests."""
 
 import os
+import threading
+import time
 
 
 class ModuleOnlyValue:
@@ -14,6 +16,10 @@ class ModuleOnlyValue:
         :param payload: Integer payload.
         """
         self.payload = payload
+
+
+class SandboxRaisedError(Exception):
+    """Custom exception class raised by fixture methods."""
 
 
 class IsolatedCounter:
@@ -56,6 +62,69 @@ class IsolatedCounter:
         :returns: Sum of values.
         """
         return self.value + peer.value
+
+    def callback_value(self, callback: object, value: int) -> int:
+        """Invoke a callback and return its integer result.
+
+        :param callback: Callback object supplied by the caller process.
+        :param value: Input value passed to the callback.
+        :returns: Integer callback result.
+        :raises TypeError: If ``callback`` is not callable or result is not ``int``.
+        """
+        is_callable: bool = callable(callback)
+        if is_callable is False:
+            raise TypeError("callback must be callable")
+        result: object = callback(value)  # type: ignore[operator]
+        if isinstance(result, int) is False:
+            raise TypeError("callback must return int")
+        return result
+
+    def inspect_marker(self, payload: object) -> str:
+        """Read ``payload.marker`` and return it as a string.
+
+        :param payload: Arbitrary object supplied by the caller process.
+        :returns: Marker string.
+        :raises AttributeError: If ``payload`` does not expose ``marker``.
+        """
+        marker_obj: object = getattr(payload, "marker")
+        if isinstance(marker_obj, str) is True:
+            return marker_obj
+        return str(marker_obj)
+
+    def compare_identity(self, first: object, second: object) -> bool:
+        """Return whether two values are identical.
+
+        :param first: First value.
+        :param second: Second value.
+        :returns: ``True`` when both values are the same object.
+        """
+        return first is second
+
+    def raise_custom_error(self, message: str) -> None:
+        """Raise a fixture-defined exception.
+
+        :param message: Error message text.
+        :raises SandboxRaisedError: Always.
+        """
+        raise SandboxRaisedError(message)
+
+    def make_non_picklable_native_value(self) -> object:
+        """Return an unpicklable value that does not originate from this module tree.
+
+        :returns: Native lock object.
+        """
+        return threading.Lock()
+
+    def sleep_then_increment(self, delay_seconds: float, delta: int = 1) -> int:
+        """Sleep and then increment.
+
+        :param delay_seconds: Sleep duration in seconds.
+        :param delta: Increment amount.
+        :returns: Updated value.
+        """
+        time.sleep(delay_seconds)
+        self.value += delta
+        return self.value
 
     def make_unpicklable(self) -> object:
         """Return an unpicklable value.
