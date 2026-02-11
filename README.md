@@ -54,23 +54,41 @@ This is intentional and enforces a hard barrier so the root process never import
 
 ## API
 
-### `extradite(target: str) -> type`
+### `extradite(target: str, share_key: str | None = None) -> type`
 
 - `target` format: `"module.path:ClassName"`.
+- `share_key` is optional; when provided, calls with the same key reuse one backing child process.
 - returns a dynamic proxy class.
 - constructing that proxy creates remote instances in the child process.
+- default behavior is unchanged: without `share_key`, each call gets its own child process.
 
 ## Constraints and caveats
 
 - The target module must not be imported in the root process before creating the proxy.
 - Passing objects between different proxy sessions is disallowed.
 - Some advanced Python interactions may be unsupported and raise `UnsupportedInteractionError`.
+- If you use `share_key`, `Class.close()` releases that class handle; the shared child process exits when the last handle for that key is closed.
 
 ## Running tests
 
 ```bash
 PYTHONPATH=src pytest
 ```
+
+## Subinterpreter demonstration (Python 3.14)
+
+This project includes a runnable showcase that proves two points:
+
+- direct subinterpreter imports can fail for native extensions that are not subinterpreter-safe;
+- the same workload succeeds from subinterpreters when routed through `extradite`.
+
+Run:
+
+```bash
+python3.14 examples/subinterpreter_extradite_demo.py
+```
+
+The demo intentionally targets `readline` through `extradite.demo.native_dependency_workload`, because `readline` is a native module that reports unsupported subinterpreter loading in Python 3.14. The extradited phase exercises real `readline` APIs (`clear_history`, `add_history`, `get_history_item`, and completer-delimiter configuration), then validates those outputs in the subinterpreter driver.
 
 ## License
 

@@ -13,6 +13,9 @@ from extradite import extradite
 TARGET_MODULE: str = "tests.fixtures.sandbox_target"
 TARGET_CLASS: str = "IsolatedCounter"
 TARGET: str = f"{TARGET_MODULE}:{TARGET_CLASS}"
+PEER_MODULE: str = "tests.fixtures.sandbox_peer"
+PEER_CLASS: str = "PeerCounter"
+PEER_TARGET: str = f"{PEER_MODULE}:{PEER_CLASS}"
 
 
 def _purge_module(module_name: str) -> None:
@@ -36,8 +39,10 @@ def _clean_target_module_tree() -> Iterator[None]:
     :yields: Control to the active test.
     """
     _purge_module(TARGET_MODULE)
+    _purge_module(PEER_MODULE)
     yield
     _purge_module(TARGET_MODULE)
+    _purge_module(PEER_MODULE)
 
 
 def test_extradited_usage_is_transparent_for_supported_interactions() -> None:
@@ -118,3 +123,62 @@ def test_module_leak_detection_blocks_new_session() -> None:
     importlib.import_module(TARGET_MODULE)
     with pytest.raises(ExtraditeModuleLeakError):
         extradite(TARGET)
+
+
+def test_share_key_reuses_session_for_same_target() -> None:
+    """Verify that same-target calls with the same share key reuse one process."""
+    share_key: str = "same-target"
+    first_cls: type = extradite(TARGET, share_key=share_key)
+    second_cls: type = extradite(TARGET, share_key=share_key)
+    first = None
+    second = None
+    try:
+        first = first_cls(10)
+        second = second_cls(20)
+
+        first_pid: object = first.worker_pid()
+        second_pid: object = second.worker_pid()
+        assert first_pid == second_pid
+
+        first_cls.close()
+        updated: object = second.increment(3)
+        assert updated == 23
+    finally:
+        if first is not None:
+            first.close()
+        if second is not None:
+            second.close()
+        first_cls.close()
+        second_cls.close()
+
+
+def test_share_key_reuses_session_across_different_targets() -> None:
+    """Verify that one share key can co-locate different modules in one process."""
+    share_key: str = "cross-target"
+    counter_cls: type = extradite(TARGET, share_key=share_key)
+    peer_cls: type = extradite(PEER_TARGET, share_key=share_key)
+    counter = None
+    peer = None
+    try:
+        counter = counter_cls(3)
+        peer = peer_cls(7)
+
+        counter_pid: object = counter.worker_pid()
+        peer_pid: object = peer.worker_pid()
+        assert counter_pid == peer_pid
+
+        counter_cls.close()
+        peer_updated: object = peer.increment(5)
+        assert peer_updated == 12
+
+        target_loaded: bool = TARGET_MODULE in sys.modules
+        peer_loaded: bool = PEER_MODULE in sys.modules
+        assert target_loaded is False
+        assert peer_loaded is False
+    finally:
+        if counter is not None:
+            counter.close()
+        if peer is not None:
+            peer.close()
+        counter_cls.close()
+        peer_cls.close()

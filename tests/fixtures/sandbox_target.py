@@ -1,5 +1,7 @@
 """Target module imported only in extradite child processes during tests."""
 
+import os
+
 
 class ModuleOnlyValue:
     """Local class that must never cross the extradite pickle barrier."""
@@ -82,3 +84,10 @@ class IsolatedCounter:
         :returns: Representation string.
         """
         return f"IsolatedCounter(value={self.value}, tag={self.tag!r})"
+
+    def worker_pid(self) -> int:
+        """Return the current worker process identifier.
+
+        :returns: Worker process identifier.
+        """
+        return os.getpid()

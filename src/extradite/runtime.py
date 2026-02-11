@@ -7,6 +7,7 @@ import pickle
 import sys
 import threading
 import weakref
+from collections.abc import Callable
 from multiprocessing.connection import Connection
 from typing import Any
 from typing import ClassVar
@@ -17,6 +18,9 @@ from extradite.errors import ExtraditeRemoteError
 from extradite.errors import UnsupportedInteractionError
 from extradite.worker import REMOTE_REF_KEY
 from extradite.worker import worker_entry
+
+_SHARED_SESSION_LOCK: threading.RLock = threading.RLock()
+_SHARED_SESSIONS_BY_KEY: dict[str, "ExtraditeSession"] = {}
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -31,6 +35,20 @@ def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
         return True
     protected_prefix: str = f"{protected_module_name}."
     return module_name.startswith(protected_prefix)
+
+
+def _is_protected_by_any_module(module_name: str, protected_module_names: set[str]) -> bool:
+    """Check whether ``module_name`` belongs to any protected module tree.
+
+    :param module_name: Candidate module path.
+    :param protected_module_names: Protected module roots.
+    :returns: ``True`` when candidate belongs to any protected module tree.
+    """
+    for protected_module_name in protected_module_names:
+        is_protected: bool = _is_protected_module(module_name, protected_module_name)
+        if is_protected is True:
+            return True
+    return False
 
 
 def _parse_target(target: str) -> tuple[str, str]:
@@ -73,16 +91,16 @@ def _find_module_leaks(module_name: str) -> list[str]:
 class _RootSafeUnpickler(pickle.Unpickler):
     """Unpickler that blocks imports from the protected module tree."""
 
-    _protected_module_name: str
+    _protected_module_names: set[str]
 
-    def __init__(self, payload_stream: io.BytesIO, protected_module_name: str) -> None:
+    def __init__(self, payload_stream: io.BytesIO, protected_module_names: set[str]) -> None:
         """Initialize the guarded unpickler.
 
         :param payload_stream: Byte stream to decode.
-        :param protected_module_name: Protected module root.
+        :param protected_module_names: Protected module roots.
         """
         super().__init__(payload_stream)
-        self._protected_module_name = protected_module_name
+        self._protected_module_names = set(protected_module_names)
 
     def find_class(self, module: str, name: str) -> Any:
         """Resolve global references during unpickling.
@@ -92,7 +110,7 @@ class _RootSafeUnpickler(pickle.Unpickler):
         :returns: Resolved class/function object.
         :raises ExtraditeModuleLeakError: If protected-module import is requested.
         """
-        is_protected: bool = _is_protected_module(module, self._protected_module_name)
+        is_protected: bool = _is_protected_by_any_module(module, self._protected_module_names)
         if is_protected is True:
             raise ExtraditeModuleLeakError(
                 "Refusing to unpickle payload that references isolated module "
@@ -101,17 +119,17 @@ class _RootSafeUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 
-def _safe_unpickle(payload: bytes, protected_module_name: str) -> object:
+def _safe_unpickle(payload: bytes, protected_module_names: set[str]) -> object:
     """Unpickle bytes with protected-module import blocking.
 
     :param payload: Pickled payload bytes.
-    :param protected_module_name: Protected module root.
+    :param protected_module_names: Protected module roots.
     :returns: Unpickled value.
     :raises ExtraditeProtocolError: If payload cannot be unpickled.
     :raises ExtraditeModuleLeakError: If protected-module import is requested.
     """
     stream: io.BytesIO = io.BytesIO(payload)
-    unpickler = _RootSafeUnpickler(stream, protected_module_name)
+    unpickler = _RootSafeUnpickler(stream, protected_module_names)
     try:
         return unpickler.load()
     except ExtraditeModuleLeakError:
@@ -165,10 +183,32 @@ class _RemoteCallProxy:
         )
 
 
+class _ClassCloseProxy:
+    """Call wrapper that releases one class proxy handle."""
+
+    _session: "ExtraditeSession"
+    _remote_target: str
+
+    def __init__(self, session: "ExtraditeSession", remote_target: str) -> None:
+        """Initialize a class close wrapper.
+
+        :param session: Owning session.
+        :param remote_target: Remote target in ``module.path:ClassName`` format.
+        """
+        self._session = session
+        self._remote_target = remote_target
+
+    def __call__(self) -> None:
+        """Release this class proxy handle."""
+        self._session.release_target(self._remote_target)
+
+
 class ExtraditedMeta(type):
     """Metaclass for dynamically generated extradited proxy classes."""
 
     _session: ClassVar["ExtraditeSession"]
+    _class_object_id: ClassVar[int]
+    _remote_target: ClassVar[str]
 
     def __call__(cls, *args: object, **kwargs: object) -> object:
         """Construct a remote instance and return its local proxy.
@@ -178,7 +218,8 @@ class ExtraditedMeta(type):
         :returns: Local proxy to the remote instance.
         """
         session: ExtraditeSession = cls._session
-        object_id: int = session.construct_instance(list(args), kwargs)
+        class_object_id: int = cls._class_object_id
+        object_id: int = session.construct_instance(class_object_id, list(args), kwargs)
         return session.get_or_create_proxy(object_id, cls)
 
     def __getattribute__(cls, attr_name: str) -> object:
@@ -189,7 +230,8 @@ class ExtraditedMeta(type):
         """
         if attr_name == "close":
             session: ExtraditeSession = type.__getattribute__(cls, "_session")
-            return session.close
+            remote_target: str = type.__getattribute__(cls, "_remote_target")
+            return _ClassCloseProxy(session, remote_target)
         return super().__getattribute__(attr_name)
 
     def __getattr__(cls, attr_name: str) -> object:
@@ -199,7 +241,7 @@ class ExtraditedMeta(type):
         :returns: Class attribute value or callable wrapper.
         """
         session: ExtraditeSession = cls._session
-        class_object_id: int = session.class_object_id
+        class_object_id: int = cls._class_object_id
         return session.get_attr(class_object_id, attr_name)
 
 
@@ -207,6 +249,7 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
     """Base instance proxy that forwards operations to the child process."""
 
     _session: ClassVar["ExtraditeSession"]
+    _class_object_id: ClassVar[int]
     _remote_target: ClassVar[str]
     _remote_object_id: int
     _finalizer: weakref.finalize
@@ -508,54 +551,48 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
 class ExtraditeSession:
     """Manage one child interpreter and its IPC channel."""
 
-    _module_name: str
-    _class_qualname: str
-    _remote_target: str
+    _share_key: str | None
+    _close_callback: Callable[[], None] | None
     _connection: Connection | None
     _process: multiprocessing.Process | None
-    _class_object_id: int | None
     _next_request_id: int
     _is_closed: bool
     _lock: threading.RLock
     _proxy_cache: "weakref.WeakValueDictionary[int, ExtraditedObjectBase]"
+    _protected_module_names: set[str]
+    _class_object_ids_by_target: dict[str, int]
+    _target_reference_counts: dict[str, int]
 
-    def __init__(self, module_name: str, class_qualname: str) -> None:
+    def __init__(self, share_key: str | None = None, close_callback: Callable[[], None] | None = None) -> None:
         """Initialize a session.
 
-        :param module_name: Isolated module path.
-        :param class_qualname: Remote class qualname.
+        :param share_key: Optional share key used by the session registry.
+        :param close_callback: Optional callback invoked once when the session closes.
         """
-        self._module_name = module_name
-        self._class_qualname = class_qualname
-        self._remote_target = f"{module_name}:{class_qualname}"
+        self._share_key = share_key
+        self._close_callback = close_callback
         self._connection = None
         self._process = None
-        self._class_object_id = None
         self._next_request_id = 1
         self._is_closed = False
         self._lock = threading.RLock()
         self._proxy_cache = weakref.WeakValueDictionary()
+        self._protected_module_names = set()
+        self._class_object_ids_by_target = {}
+        self._target_reference_counts = {}
 
     @property
-    def class_object_id(self) -> int:
-        """Return the remote identifier of the class object.
+    def is_closed(self) -> bool:
+        """Report whether this session has been closed.
 
-        :returns: Remote class object identifier.
-        :raises ExtraditeProtocolError: If session has not started.
-        """
-        class_id: int | None = self._class_object_id
-        if class_id is None:
-            raise ExtraditeProtocolError("Session has not been started")
-        return class_id
-
-    def start(self) -> None:
-        """Start the child interpreter process.
-
-        :raises ExtraditeModuleLeakError: If the protected module is loaded locally.
-        :raises ExtraditeRemoteError: If startup in child process fails.
+        :returns: ``True`` when the session is closed.
         """
         with self._lock:
-            self._assert_module_not_loaded()
+            return self._is_closed
+
+    def start(self) -> None:
+        """Start the child interpreter process."""
+        with self._lock:
             is_started: bool = self._connection is not None
             if is_started is True:
                 return
@@ -564,7 +601,7 @@ class ExtraditeSession:
             parent_connection, child_connection = context.Pipe(duplex=True)
             process = context.Process(
                 target=worker_entry,
-                args=(child_connection, self._module_name, self._class_qualname),
+                args=(child_connection,),
             )
             process.daemon = True
             process.start()
@@ -579,25 +616,94 @@ class ExtraditeSession:
                 self.close()
                 raise ExtraditeProtocolError("Startup payload must be a dict")
 
-            class_object_id: object = payload.get("class_object_id")
-            if isinstance(class_object_id, int) is False:
+            ready: object = payload.get("ready")
+            if ready is not True:
                 self.close()
-                raise ExtraditeProtocolError("Startup payload missing class_object_id")
+                raise ExtraditeProtocolError("Startup payload missing ready marker")
 
-            self._class_object_id = class_object_id
             atexit.register(self.close)
 
-    def _assert_module_not_loaded(self) -> None:
-        """Ensure the isolated module is absent from root-process imports.
+    def register_target(self, module_name: str, class_qualname: str) -> int:
+        """Register or reference one remote target class.
 
+        :param module_name: Module path.
+        :param class_qualname: Class qualname.
+        :returns: Remote class object identifier.
+        :raises ExtraditeModuleLeakError: If target module is loaded in root process.
+        """
+        remote_target: str = f"{module_name}:{class_qualname}"
+        with self._lock:
+            self.start()
+
+            existing_object_id: int | None = self._class_object_ids_by_target.get(remote_target)
+            if existing_object_id is not None:
+                existing_count: int = self._target_reference_counts.get(remote_target, 0)
+                self._target_reference_counts[remote_target] = existing_count + 1
+                return existing_object_id
+
+            self._assert_module_not_loaded(module_name)
+            self._protected_module_names.add(module_name)
+
+            response: dict[str, object] = self._send_request(
+                "load_class",
+                {
+                    "module_name": module_name,
+                    "class_qualname": class_qualname,
+                },
+            )
+
+            payload: object = response.get("payload")
+            if isinstance(payload, dict) is False:
+                raise ExtraditeProtocolError("load_class payload must be a dict")
+
+            class_object_id: object = payload.get("class_object_id")
+            if isinstance(class_object_id, int) is False:
+                raise ExtraditeProtocolError("load_class payload missing int class_object_id")
+
+            self._class_object_ids_by_target[remote_target] = class_object_id
+            self._target_reference_counts[remote_target] = 1
+            return class_object_id
+
+    def release_target(self, remote_target: str) -> None:
+        """Release one class proxy handle associated with this session.
+
+        :param remote_target: Remote target in ``module.path:ClassName`` format.
+        """
+        should_close: bool = False
+        with self._lock:
+            current_count: int | None = self._target_reference_counts.get(remote_target)
+            if current_count is None:
+                return
+
+            if current_count > 1:
+                self._target_reference_counts[remote_target] = current_count - 1
+                return
+
+            self._target_reference_counts.pop(remote_target, None)
+            self._class_object_ids_by_target.pop(remote_target, None)
+            should_close = len(self._target_reference_counts) == 0
+
+        if should_close is True:
+            self.close()
+
+    def _assert_module_not_loaded(self, module_name: str) -> None:
+        """Ensure a protected module is absent from root-process imports.
+
+        :param module_name: Fully-qualified module path.
         :raises ExtraditeModuleLeakError: If the module is present in ``sys.modules``.
         """
-        leaks: list[str] = _find_module_leaks(self._module_name)
+        leaks: list[str] = _find_module_leaks(module_name)
         if len(leaks) > 0:
             leak_list: str = ", ".join(leaks)
             raise ExtraditeModuleLeakError(
                 "Isolated module leaked into root process: " + leak_list
             )
+
+    def _assert_protected_modules_not_loaded(self) -> None:
+        """Ensure all protected modules are absent from root-process imports."""
+        protected_module_names: list[str] = sorted(self._protected_module_names)
+        for module_name in protected_module_names:
+            self._assert_module_not_loaded(module_name)
 
     def _require_connection(self) -> Connection:
         """Return the active IPC connection.
@@ -753,7 +859,7 @@ class ExtraditeSession:
         if isinstance(payload, bytes) is False:
             raise ExtraditeProtocolError("Encoded pickle payload must be bytes")
 
-        return _safe_unpickle(payload, self._module_name)
+        return _safe_unpickle(payload, self._protected_module_names)
 
     def _send_request(self, action: str, payload: dict[str, object]) -> dict[str, object]:
         """Send one request and return its decoded top-level response.
@@ -763,7 +869,7 @@ class ExtraditeSession:
         :returns: Response dictionary.
         """
         with self._lock:
-            self._assert_module_not_loaded()
+            self._assert_protected_modules_not_loaded()
             connection: Connection = self._require_connection()
 
             request_id: int = self._next_request_id
@@ -782,9 +888,10 @@ class ExtraditeSession:
 
             return self._receive_response(expected_request_id=request_id)
 
-    def construct_instance(self, args: list[object], kwargs: dict[str, object]) -> int:
+    def construct_instance(self, class_object_id: int, args: list[object], kwargs: dict[str, object]) -> int:
         """Construct a remote class instance.
 
+        :param class_object_id: Remote class object identifier.
         :param args: Constructor positional arguments.
         :param kwargs: Constructor keyword arguments.
         :returns: Remote object identifier.
@@ -797,6 +904,7 @@ class ExtraditeSession:
         response: dict[str, object] = self._send_request(
             "construct",
             {
+                "class_object_id": class_object_id,
                 "args": encoded_args,
                 "kwargs": encoded_kwargs,
             },
@@ -952,6 +1060,7 @@ class ExtraditeSession:
 
     def close(self) -> None:
         """Close the session and terminate the child process."""
+        close_callback: Callable[[], None] | None = None
         with self._lock:
             already_closed: bool = self._is_closed
             if already_closed is True:
@@ -986,11 +1095,57 @@ class ExtraditeSession:
 
             self._connection = None
             self._process = None
-            self._class_object_id = None
             self._proxy_cache.clear()
+            self._class_object_ids_by_target.clear()
+            self._target_reference_counts.clear()
+            self._protected_module_names.clear()
+            close_callback = self._close_callback
+            self._close_callback = None
+
+        if close_callback is not None:
+            close_callback()
 
 
-def _build_proxy_class(module_name: str, class_qualname: str, session: ExtraditeSession) -> type:
+def _remove_shared_session_if_current(share_key: str, session: ExtraditeSession) -> None:
+    """Remove a shared session only when it is still the current registry entry.
+
+    :param share_key: Shared-session key.
+    :param session: Candidate session to remove.
+    """
+    with _SHARED_SESSION_LOCK:
+        current_session: ExtraditeSession | None = _SHARED_SESSIONS_BY_KEY.get(share_key)
+        if current_session is session:
+            _SHARED_SESSIONS_BY_KEY.pop(share_key, None)
+
+
+def _get_or_create_shared_session(share_key: str) -> tuple[ExtraditeSession, bool]:
+    """Get or create a shared session for ``share_key``.
+
+    :param share_key: Shared-session key.
+    :returns: Tuple of ``(session, was_created)``.
+    """
+    with _SHARED_SESSION_LOCK:
+        existing: ExtraditeSession | None = _SHARED_SESSIONS_BY_KEY.get(share_key)
+        if existing is not None:
+            is_closed: bool = existing.is_closed
+            if is_closed is False:
+                return existing, False
+            _SHARED_SESSIONS_BY_KEY.pop(share_key, None)
+
+        session = ExtraditeSession(
+            share_key=share_key,
+            close_callback=lambda: _remove_shared_session_if_current(share_key, session),
+        )
+        _SHARED_SESSIONS_BY_KEY[share_key] = session
+        return session, True
+
+
+def _build_proxy_class(
+    module_name: str,
+    class_qualname: str,
+    session: ExtraditeSession,
+    class_object_id: int,
+) -> type:
     """Build the dynamic proxy class.
 
     :param module_name: Isolated module name.
@@ -1005,20 +1160,36 @@ def _build_proxy_class(module_name: str, class_qualname: str, session: Extradite
         "__module__": "extradite.runtime",
         "__doc__": f"Proxy class for remote target {remote_target}.",
         "_session": session,
+        "_class_object_id": class_object_id,
         "_remote_target": remote_target,
     }
     proxy_class: type = ExtraditedMeta(class_name, (ExtraditedObjectBase,), namespace)
     return proxy_class
 
 
-def create_extradited_class(target: str) -> type:
+def create_extradited_class(target: str, share_key: str | None = None) -> type:
     """Create a class proxy for an isolated import target.
 
     :param target: Target in ``module.path:ClassName`` format.
+    :param share_key: Optional key that reuses a child process across calls.
     :returns: Dynamic proxy class for that target.
     :raises ExtraditeModuleLeakError: If target module already leaked into root process.
     """
     module_name, class_qualname = _parse_target(target)
-    session = ExtraditeSession(module_name, class_qualname)
-    session.start()
-    return _build_proxy_class(module_name, class_qualname, session)
+    session: ExtraditeSession
+    is_new_session: bool
+    if share_key is None:
+        session = ExtraditeSession()
+        is_new_session = True
+    else:
+        session, is_new_session = _get_or_create_shared_session(share_key)
+
+    try:
+        session.start()
+        class_object_id: int = session.register_target(module_name, class_qualname)
+    except Exception:
+        if is_new_session is True:
+            session.close()
+        raise
+
+    return _build_proxy_class(module_name, class_qualname, session, class_object_id)

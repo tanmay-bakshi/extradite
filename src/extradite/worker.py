@@ -25,27 +25,41 @@ def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
     return module_name.startswith(protected_prefix)
 
 
+def _is_protected_by_any_module(module_name: str, protected_module_names: set[str]) -> bool:
+    """Check whether ``module_name`` matches any protected module tree.
+
+    :param module_name: Candidate module name.
+    :param protected_module_names: Protected module roots.
+    :returns: ``True`` when candidate belongs to any protected module tree.
+    """
+    for protected_module_name in protected_module_names:
+        is_protected: bool = _is_protected_module(module_name, protected_module_name)
+        if is_protected is True:
+            return True
+    return False
+
+
 def _value_originates_from_module(
     value: object,
-    protected_module_name: str,
+    protected_module_names: set[str],
     seen_ids: set[int],
 ) -> bool:
     """Recursively detect references to values from the protected module.
 
     :param value: Value to inspect.
-    :param protected_module_name: Protected module root.
+    :param protected_module_names: Protected module roots.
     :param seen_ids: Cycle-breaker set.
     :returns: ``True`` when a protected-module reference is found.
     """
     value_module: object = getattr(value, "__module__", None)
     if isinstance(value_module, str) is True:
-        is_protected: bool = _is_protected_module(value_module, protected_module_name)
+        is_protected: bool = _is_protected_by_any_module(value_module, protected_module_names)
         if is_protected is True:
             return True
 
     value_type: type = type(value)
     type_module: str = value_type.__module__
-    type_is_protected: bool = _is_protected_module(type_module, protected_module_name)
+    type_is_protected: bool = _is_protected_by_any_module(type_module, protected_module_names)
     if type_is_protected is True:
         return True
 
@@ -60,29 +74,29 @@ def _value_originates_from_module(
 
     if isinstance(value, (list, tuple, set, frozenset)) is True:
         for item in value:
-            item_is_protected: bool = _value_originates_from_module(item, protected_module_name, seen_ids)
+            item_is_protected: bool = _value_originates_from_module(item, protected_module_names, seen_ids)
             if item_is_protected is True:
                 return True
         return False
 
     if isinstance(value, dict) is True:
         for key, item in value.items():
-            key_is_protected: bool = _value_originates_from_module(key, protected_module_name, seen_ids)
+            key_is_protected: bool = _value_originates_from_module(key, protected_module_names, seen_ids)
             if key_is_protected is True:
                 return True
-            item_is_protected = _value_originates_from_module(item, protected_module_name, seen_ids)
+            item_is_protected = _value_originates_from_module(item, protected_module_names, seen_ids)
             if item_is_protected is True:
                 return True
         return False
 
     if isinstance(value, slice) is True:
-        start_is_protected: bool = _value_originates_from_module(value.start, protected_module_name, seen_ids)
+        start_is_protected: bool = _value_originates_from_module(value.start, protected_module_names, seen_ids)
         if start_is_protected is True:
             return True
-        stop_is_protected: bool = _value_originates_from_module(value.stop, protected_module_name, seen_ids)
+        stop_is_protected: bool = _value_originates_from_module(value.stop, protected_module_names, seen_ids)
         if stop_is_protected is True:
             return True
-        step_is_protected: bool = _value_originates_from_module(value.step, protected_module_name, seen_ids)
+        step_is_protected: bool = _value_originates_from_module(value.step, protected_module_names, seen_ids)
         if step_is_protected is True:
             return True
         return False
@@ -90,7 +104,7 @@ def _value_originates_from_module(
     instance_dict: object = getattr(value, "__dict__", None)
     if isinstance(instance_dict, dict) is True:
         for item in instance_dict.values():
-            item_is_protected = _value_originates_from_module(item, protected_module_name, seen_ids)
+            item_is_protected = _value_originates_from_module(item, protected_module_names, seen_ids)
             if item_is_protected is True:
                 return True
 
@@ -107,7 +121,7 @@ def _value_originates_from_module(
         if hasattr(value, slot_name) is False:
             continue
         slot_value: object = getattr(value, slot_name)
-        slot_is_protected: bool = _value_originates_from_module(slot_value, protected_module_name, seen_ids)
+        slot_is_protected: bool = _value_originates_from_module(slot_value, protected_module_names, seen_ids)
         if slot_is_protected is True:
             return True
 
@@ -192,7 +206,10 @@ def _send_ok(connection: Connection, request_id: int, payload: dict[str, object]
         "status": "ok",
         "payload": payload,
     }
-    connection.send(message)
+    try:
+        connection.send(message)
+    except (BrokenPipeError, EOFError, OSError):
+        return
 
 
 def _send_error(connection: Connection, request_id: int, error_type: str, error_message: str, stacktrace: str) -> None:
@@ -213,7 +230,10 @@ def _send_error(connection: Connection, request_id: int, error_type: str, error_
             "stacktrace": stacktrace,
         },
     }
-    connection.send(message)
+    try:
+        connection.send(message)
+    except (BrokenPipeError, EOFError, OSError):
+        return
 
 
 def _is_remote_ref_payload(value: object) -> bool:
@@ -268,16 +288,16 @@ def _decode_value(value: object, registry: ObjectRegistry) -> object:
     return value
 
 
-def _encode_value(value: object, protected_module_name: str) -> dict[str, object]:
+def _encode_value(value: object, protected_module_names: set[str]) -> dict[str, object]:
     """Encode a local value for transfer back to the parent.
 
     :param value: Runtime value.
-    :param protected_module_name: Protected module root.
+    :param protected_module_names: Protected module roots.
     :returns: Encoded value payload containing pickle bytes.
     :raises UnsupportedInteractionError: If transfer is disallowed.
     """
     seen_ids: set[int] = set()
-    contains_protected: bool = _value_originates_from_module(value, protected_module_name, seen_ids)
+    contains_protected: bool = _value_originates_from_module(value, protected_module_names, seen_ids)
     if contains_protected is True:
         raise UnsupportedInteractionError(
             "Refusing to transfer values that originate from the protected isolated module"
@@ -389,21 +409,32 @@ def _decode_args(message: dict[str, object], registry: ObjectRegistry) -> tuple[
 def _handle_request(
     message: dict[str, object],
     registry: ObjectRegistry,
-    class_object_id: int,
-    protected_module_name: str,
+    protected_module_names: set[str],
 ) -> dict[str, object]:
     """Handle a single request.
 
     :param message: Request message.
     :param registry: Child-process object registry.
-    :param class_object_id: Remote identifier for the class object.
-    :param protected_module_name: Protected module root.
+    :param protected_module_names: Protected module roots.
     :returns: Success payload.
     :raises ExtraditeProtocolError: If the request is malformed.
     """
     action: str = _require_action(message)
 
+    if action == "load_class":
+        module_name: str = _require_str_field(message, "module_name")
+        class_qualname: str = _require_str_field(message, "class_qualname")
+        imported_module = importlib.import_module(module_name)
+        class_object: object = _resolve_qualname(imported_module, class_qualname)
+        is_type: bool = isinstance(class_object, type)
+        if is_type is False:
+            raise ExtraditeProtocolError(f"Target {module_name}:{class_qualname} is not a class")
+        class_object_id: int = registry.store(class_object, pinned=True)
+        protected_module_names.add(module_name)
+        return {"class_object_id": class_object_id}
+
     if action == "construct":
+        class_object_id: int = _require_int_field(message, "class_object_id")
         args, kwargs = _decode_args(message, registry)
         class_object: object = registry.get(class_object_id)
         instance: object = class_object(*args, **kwargs)  # type: ignore[operator]
@@ -418,7 +449,7 @@ def _handle_request(
         is_callable: bool = callable(attr_value)
         if is_callable is True:
             return {"callable": True}
-        return {"callable": False, "value": _encode_value(attr_value, protected_module_name)}
+        return {"callable": False, "value": _encode_value(attr_value, protected_module_names)}
 
     if action == "set_attr":
         object_id = _require_int_field(message, "object_id")
@@ -446,7 +477,7 @@ def _handle_request(
         if is_callable is False:
             raise ExtraditeProtocolError(f"Attribute {attr_name!r} is not callable")
         result: object = callable_obj(*args, **kwargs)  # type: ignore[operator]
-        return {"value": _encode_value(result, protected_module_name)}
+        return {"value": _encode_value(result, protected_module_names)}
 
     if action == "release_object":
         object_id = _require_int_field(message, "object_id")
@@ -459,23 +490,16 @@ def _handle_request(
     raise ExtraditeProtocolError(f"Unsupported action: {action}")
 
 
-def worker_entry(connection: Connection, module_name: str, class_qualname: str) -> None:
+def worker_entry(connection: Connection) -> None:
     """Run the child interpreter message loop.
 
     :param connection: IPC connection from parent process.
-    :param module_name: Module to import in the child process.
-    :param class_qualname: Class qualname inside ``module_name``.
     """
     registry = ObjectRegistry()
+    protected_module_names: set[str] = set()
 
     try:
-        imported_module = importlib.import_module(module_name)
-        class_object: object = _resolve_qualname(imported_module, class_qualname)
-        is_type: bool = isinstance(class_object, type)
-        if is_type is False:
-            raise ExtraditeProtocolError(f"Target {module_name}:{class_qualname} is not a class")
-        class_object_id: int = registry.store(class_object, pinned=True)
-        _send_ok(connection, 0, {"class_object_id": class_object_id})
+        _send_ok(connection, 0, {"ready": True})
     except Exception as exc:
         _send_error(
             connection,
@@ -522,8 +546,7 @@ def worker_entry(connection: Connection, module_name: str, class_qualname: str) 
             payload: dict[str, object] = _handle_request(
                 request_message,
                 registry,
-                class_object_id,
-                module_name,
+                protected_module_names,
             )
             _send_ok(connection, request_id, payload)
             shutdown_requested: object = payload.get("shutdown")
