@@ -745,6 +745,94 @@ def test_method_batch_call_policy_override() -> None:
         counter_cls.close()
 
 
+def test_callback_batch_bridge_uses_batched_parent_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callback fanout should use batched child->parent requests when available."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    action_counts: dict[str, int] = {"call_attr": 0, "call_attr_batch": 0}
+    original_execute_local_request: Callable[[runtime.ExtraditeSession, dict[str, object]], dict[str, object]] = (
+        runtime.ExtraditeSession._execute_local_request
+    )
+
+    def _counting_execute_local_request(
+        session: runtime.ExtraditeSession,
+        message: dict[str, object],
+    ) -> dict[str, object]:
+        """Count child-origin call actions while delegating to runtime behavior.
+
+        :param session: Active runtime session.
+        :param message: Child-origin request message.
+        :returns: Runtime response payload.
+        """
+        action_obj: object = message.get("action")
+        if action_obj == "call_attr":
+            action_counts["call_attr"] += 1
+        if action_obj == "call_attr_batch":
+            action_counts["call_attr_batch"] += 1
+        return original_execute_local_request(session, message)
+
+    monkeypatch.setattr(
+        runtime.ExtraditeSession,
+        "_execute_local_request",
+        _counting_execute_local_request,
+    )
+    try:
+        counter = counter_cls(1)
+
+        def callback(value: int) -> int:
+            """Return deterministic callback output.
+
+            :param value: Input value.
+            :returns: Callback output.
+            """
+            return (value * 2) + 1
+
+        item_count: int = 75
+        result_obj: object = counter.callback_accumulate(callback, item_count)
+        expected_total: int = sum((index * 2) + 1 for index in range(item_count))
+        assert result_obj == expected_total
+        assert action_counts["call_attr_batch"] > 0
+        assert action_counts["call_attr"] == 0
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_callback_batch_bridge_short_circuits_on_parent_error() -> None:
+    """Callback batch bridge should stop on first callback error and preserve call count."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    observed_calls: list[int] = []
+    try:
+        counter = counter_cls(1)
+
+        def callback(value: int) -> int:
+            """Raise at one deterministic index.
+
+            :param value: Input value.
+            :returns: Incremented value when no error is raised.
+            :raises RuntimeError: When ``value`` equals ``7``.
+            """
+            observed_calls.append(value)
+            if value == 7:
+                raise RuntimeError("callback-failed-7")
+            return value + 1
+
+        with pytest.raises(ExtraditeRemoteError) as exc_info:
+            counter.callback_accumulate(callback, 40)
+        error_obj: ExtraditeRemoteError = exc_info.value
+        assert error_obj.remote_type_name == "RuntimeError"
+        assert len(observed_calls) == 8
+        assert observed_calls[7] == 7
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
 def test_callback_roundtrip_reentrant() -> None:
     """Ensure callback success and failure paths propagate through re-entrant RPC."""
     counter_cls: type = extradite(TARGET)

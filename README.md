@@ -127,6 +127,8 @@ This enables callback chains such as:
 
 Nested request routing is handled in-process and avoids deadlock in supported interaction patterns.
 
+For callback-heavy paths, parent callback handles exposed in the child also support batched invocation (`callback.batch([...])`) so many callback invocations can share one child->parent request.
+
 ## Type and Handle Semantics
 
 Parent-origin class handles preserve core type-style behavior in the isolated side for supported operations:

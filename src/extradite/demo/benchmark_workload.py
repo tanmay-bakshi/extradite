@@ -110,12 +110,42 @@ class BenchmarkWorkload:
         if callback_is_callable is False:
             raise TypeError("callback must be callable")
 
+        batch_attr_obj: object = getattr(callback, "batch", None)
+        batch_is_callable: bool = callable(batch_attr_obj)
+
         total: int = 0
-        for index in range(item_count):
-            result_obj: object = callback(index)  # type: ignore[operator]
-            if isinstance(result_obj, int) is False:
-                raise TypeError("callback must return int")
-            total += result_obj
+        if batch_is_callable is False:
+            for index in range(item_count):
+                result_obj: object = callback(index)  # type: ignore[operator]
+                if isinstance(result_obj, int) is False:
+                    raise TypeError("callback must return int")
+                total += result_obj
+            return total
+
+        batch_method: object = batch_attr_obj
+        batch_size: int = 64
+        completed: int = 0
+        while completed < item_count:
+            remaining: int = item_count - completed
+            current_batch_size: int = batch_size
+            if remaining < batch_size:
+                current_batch_size = remaining
+
+            call_specs: list[tuple[list[object], dict[str, object]]] = []
+            for offset in range(current_batch_size):
+                index: int = completed + offset
+                call_specs.append(([index], {}))
+            result_list_obj: object = batch_method(call_specs)  # type: ignore[operator]
+            if isinstance(result_list_obj, list) is False:
+                raise TypeError("callback.batch must return list")
+            if len(result_list_obj) != current_batch_size:
+                raise TypeError("callback.batch must return one result per call")
+
+            for result_obj in result_list_obj:
+                if isinstance(result_obj, int) is False:
+                    raise TypeError("callback must return int")
+                total += result_obj
+            completed += current_batch_size
         return total
 
     def derive_score(self, label: str, index: int) -> int:

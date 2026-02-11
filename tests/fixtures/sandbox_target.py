@@ -3,6 +3,7 @@
 import os
 import threading
 import time
+from collections.abc import Callable
 
 
 class ModuleOnlyValue:
@@ -78,6 +79,62 @@ class IsolatedCounter:
         if isinstance(result, int) is False:
             raise TypeError("callback must return int")
         return result
+
+    def callback_accumulate(self, callback: object, item_count: int) -> int:
+        """Call ``callback`` repeatedly and accumulate integer results.
+
+        :param callback: Callback object supplied by the caller process.
+        :param item_count: Number of callback invocations.
+        :returns: Sum of callback return values.
+        :raises TypeError: If callback is not callable or returns non-integer values.
+        :raises ValueError: If ``item_count`` is negative.
+        """
+        if item_count < 0:
+            raise ValueError("item_count must be >= 0")
+
+        callback_is_callable: bool = callable(callback)
+        if callback_is_callable is False:
+            raise TypeError("callback must be callable")
+
+        batch_attr_obj: object = getattr(callback, "batch", None)
+        batch_is_callable: bool = callable(batch_attr_obj)
+
+        total: int = 0
+        if batch_is_callable is False:
+            callback_method: Callable[[int], object] = callback  # type: ignore[assignment]
+            for index in range(item_count):
+                result_obj: object = callback_method(index)
+                if isinstance(result_obj, int) is False:
+                    raise TypeError("callback must return int")
+                total += result_obj
+            return total
+
+        batch_method: Callable[[list[tuple[list[object], dict[str, object]]]], object] = batch_attr_obj  # type: ignore[assignment]
+        batch_size: int = 32
+        completed: int = 0
+        while completed < item_count:
+            remaining: int = item_count - completed
+            current_batch_size: int = batch_size
+            if remaining < batch_size:
+                current_batch_size = remaining
+
+            call_specs: list[tuple[list[object], dict[str, object]]] = []
+            for offset in range(current_batch_size):
+                index: int = completed + offset
+                call_specs.append(([index], {}))
+
+            result_list_obj: object = batch_method(call_specs)
+            if isinstance(result_list_obj, list) is False:
+                raise TypeError("callback.batch must return list")
+            if len(result_list_obj) != current_batch_size:
+                raise TypeError("callback.batch must return one result per call")
+
+            for result_obj in result_list_obj:
+                if isinstance(result_obj, int) is False:
+                    raise TypeError("callback must return int")
+                total += result_obj
+            completed += current_batch_size
+        return total
 
     def callback_from_payload(self, payload: list[object], value: int) -> int:
         """Invoke the last payload item as a callback and return its integer result.

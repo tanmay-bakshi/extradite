@@ -1447,6 +1447,25 @@ class ExtraditeSession:
             kwargs[key] = self._decode_from_child(item)
         return args, kwargs
 
+    def _decode_batch_call_specs_from_child(self, message: dict[str, object]) -> list[BatchCallSpec]:
+        """Decode a batched call specification list from one child request.
+
+        :param message: Request message.
+        :returns: Decoded list of ``(args, kwargs)`` call specifications.
+        :raises ExtraditeProtocolError: If request payload shape is invalid.
+        """
+        raw_calls_obj: object = message.get("calls")
+        if isinstance(raw_calls_obj, list) is False:
+            raise ExtraditeProtocolError("calls must be a list")
+
+        decoded_call_specs: list[BatchCallSpec] = []
+        for call_index, raw_call_obj in enumerate(raw_calls_obj):
+            if isinstance(raw_call_obj, dict) is False:
+                raise ExtraditeProtocolError(f"calls[{call_index}] must be a dict")
+            decoded_args, decoded_kwargs = self._decode_args_from_child(raw_call_obj)
+            decoded_call_specs.append((decoded_args, decoded_kwargs))
+        return decoded_call_specs
+
     def _execute_local_request(self, message: dict[str, object]) -> dict[str, object]:
         """Execute one child-origin request against parent-owned objects.
 
@@ -1530,6 +1549,40 @@ class ExtraditeSession:
             else:
                 result = callable_obj(*args, **kwargs)  # type: ignore[operator]
             return {"value": self._encode_for_child(result)}
+
+        if action == "call_attr_batch":
+            object_id_obj = message.get("object_id")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("object_id must be an integer")
+            attr_name_obj = message.get("attr_name")
+            if isinstance(attr_name_obj, str) is False:
+                raise ExtraditeProtocolError("attr_name must be a string")
+
+            call_specs: list[BatchCallSpec] = self._decode_batch_call_specs_from_child(message)
+            target = self._local_object_registry.get(object_id_obj)
+            callable_obj: object = getattr(target, attr_name_obj)
+            callable_flag: bool = callable(callable_obj)
+            if callable_flag is False:
+                raise ExtraditeProtocolError(f"Attribute {attr_name_obj!r} is not callable")
+
+            encoded_values: list[object] = []
+            for args, kwargs in call_specs:
+                target_is_type: bool = isinstance(target, type)
+                repr_or_str_call: bool = (
+                    target_is_type is True
+                    and (attr_name_obj == "__repr__" or attr_name_obj == "__str__")
+                    and len(args) == 0
+                    and len(kwargs) == 0
+                )
+                if repr_or_str_call is True:
+                    if attr_name_obj == "__repr__":
+                        result: object = repr(target)
+                    else:
+                        result = str(target)
+                else:
+                    result = callable_obj(*args, **kwargs)  # type: ignore[operator]
+                encoded_values.append(self._encode_for_child(result))
+            return {"values": encoded_values}
 
         if action == "describe_object":
             object_id_obj = message.get("object_id")

@@ -641,6 +641,18 @@ class _ParentCallProxy:
         """
         return self._runtime.call_parent_attr(self._object_id, self._attr_name, list(args), kwargs)
 
+    def batch(self, call_specs: list[BatchCallSpec]) -> list[object]:
+        """Invoke this parent callable attribute using one batched request.
+
+        :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
+        :returns: Ordered decoded call results.
+        """
+        return self._runtime.call_parent_attr_batch(
+            self._object_id,
+            self._attr_name,
+            call_specs,
+        )
+
 
 class _ParentRemoteHandle:
     """Proxy object for a parent-owned handle exposed to the worker."""
@@ -890,6 +902,18 @@ class _ParentRemoteHandle:
         :returns: Remote return value.
         """
         return self._runtime.call_parent_attr(self._remote_object_id, "__call__", list(args), kwargs)
+
+    def batch(self, call_specs: list[BatchCallSpec]) -> list[object]:
+        """Invoke remote ``__call__`` repeatedly using one batched parent request.
+
+        :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
+        :returns: Ordered decoded call results.
+        """
+        return self._runtime.call_parent_attr_batch(
+            self._remote_object_id,
+            "__call__",
+            call_specs,
+        )
 
     def __instancecheck__(self, instance: object) -> bool:
         """Evaluate ``isinstance(instance, self)`` against parent class handles.
@@ -1643,6 +1667,77 @@ class WorkerRuntime:
         )
         encoded_value: object = response_payload.get("value")
         return self._decode_from_parent(encoded_value)
+
+    def _encode_batch_call_specs_for_parent(
+        self,
+        call_specs: list[BatchCallSpec],
+    ) -> list[dict[str, object]]:
+        """Encode one ordered batch-call specification list for parent transport.
+
+        :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
+        :returns: Encoded call specification list.
+        :raises TypeError: If one call specification has invalid shape or key types.
+        """
+        encoded_calls: list[dict[str, object]] = []
+        for call_index, call_spec in enumerate(call_specs):
+            call_spec_is_tuple: bool = isinstance(call_spec, tuple)
+            if call_spec_is_tuple is False:
+                raise TypeError(f"call_specs[{call_index}] must be a tuple")
+            if len(call_spec) != 2:
+                raise TypeError(f"call_specs[{call_index}] must contain (args, kwargs)")
+
+            args_obj: object = call_spec[0]
+            kwargs_obj: object = call_spec[1]
+            if isinstance(args_obj, list) is False:
+                raise TypeError(f"call_specs[{call_index}] args must be a list")
+            if isinstance(kwargs_obj, dict) is False:
+                raise TypeError(f"call_specs[{call_index}] kwargs must be a dict")
+
+            encoded_args: list[object] = [self._encode_for_parent(item) for item in args_obj]
+            encoded_kwargs: dict[str, object] = {}
+            for key_obj, value in kwargs_obj.items():
+                if isinstance(key_obj, str) is False:
+                    raise TypeError(f"call_specs[{call_index}] kwargs keys must be strings")
+                encoded_kwargs[key_obj] = self._encode_for_parent(value)
+            encoded_calls.append({"args": encoded_args, "kwargs": encoded_kwargs})
+        return encoded_calls
+
+    def call_parent_attr_batch(
+        self,
+        object_id: int,
+        attr_name: str,
+        call_specs: list[BatchCallSpec],
+    ) -> list[object]:
+        """Call one parent-side attribute repeatedly using one batched request.
+
+        :param object_id: Parent-owned object identifier.
+        :param attr_name: Callable attribute name.
+        :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
+        :returns: Ordered decoded result list.
+        :raises ExtraditeProtocolError: If response payload shape is invalid.
+        """
+        encoded_calls: list[dict[str, object]] = self._encode_batch_call_specs_for_parent(call_specs)
+        response_payload: dict[str, object] = self._send_request_to_parent(
+            "call_attr_batch",
+            {
+                "object_id": object_id,
+                "attr_name": attr_name,
+                "calls": encoded_calls,
+            },
+        )
+        encoded_values_obj: object = response_payload.get("values")
+        if isinstance(encoded_values_obj, list) is False:
+            raise ExtraditeProtocolError("call_attr_batch payload missing list values")
+
+        expected_length: int = len(call_specs)
+        result_length: int = len(encoded_values_obj)
+        if result_length != expected_length:
+            raise ExtraditeProtocolError(
+                f"call_attr_batch returned {result_length} values; expected {expected_length}"
+            )
+
+        decoded_values: list[object] = [self._decode_from_parent(item) for item in encoded_values_obj]
+        return decoded_values
 
     def set_parent_attr(self, object_id: int, attr_name: str, value: object) -> None:
         """Set one parent-side attribute.

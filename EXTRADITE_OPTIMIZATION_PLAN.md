@@ -2,7 +2,7 @@
 
 Last updated: 2026-02-11
 Owner: Codex + Tanmay
-Status: Phases 1-3 implemented; Phases 4-6 pending
+Status: Phases 1-4 implemented; Phases 5-6 pending
 
 ## Purpose
 
@@ -51,7 +51,7 @@ Baseline median results:
 | 1 | Remove Per-Request Leak-Scan Overhead | Completed (2026-02-11) | `tiny_ping`, `increment_small`, `payload_small_checksum`, `readline_digest` |
 | 2 | Structured Payload Transport Fast-Path | Completed (2026-02-11) | `payload_large_sum`, `payload_small_checksum`, `mixed_pipeline` |
 | 3 | Batched RPC for Chatty Calls | Completed (2026-02-11) | `tiny_ping`, `increment_small`, `readline_digest` |
-| 4 | Callback-Batch Bridge | Not Started | `callback_chatter` |
+| 4 | Callback-Batch Bridge | Completed (2026-02-11) | `callback_chatter` |
 | 5 | Shared-Memory Binary Transport | Not Started | `bytes_roundtrip_512kb`, large binary workloads |
 | 6 | Warm Session Lifecycle / Pooling | Not Started | `cold_start_first_call` |
 
@@ -266,6 +266,38 @@ Reduce callback chatter caused by re-entrant per-item parent callback calls.
 - Re-entrant safety tests pass (no deadlock, correct exception propagation).
 - Bench target:
   - `callback_chatter` median `us/op` improves by at least 3x.
+
+### Implementation Notes (2026-02-11)
+
+- Added worker->parent callback batch bridge:
+  - worker-side parent proxies (`_ParentRemoteHandle`, `_ParentCallProxy`) now expose `.batch(...)`;
+  - worker runtime added `call_parent_attr_batch(...)`;
+  - parent runtime now handles child-origin `call_attr_batch` requests.
+- Updated callback-heavy workload paths to opportunistically use callback batch:
+  - `src/extradite/demo/benchmark_workload.py:callback_accumulate`
+  - `tests/fixtures/sandbox_target.py:callback_accumulate`
+- Added deterministic tests for callback-batch behavior:
+  - batch path usage (counts `call_attr_batch` actions, no per-item `call_attr`);
+  - short-circuit on first callback error with expected call count.
+
+### Phase 4 Result Snapshot (Targeted Regime)
+
+Source runs:
+
+```bash
+PYTHONPATH=src python3 benchmarks/extradite_performance_benchmark.py --repetitions 5 --cases callback_chatter --json-output /tmp/extradite-phase4-before.json
+PYTHONPATH=src python3 benchmarks/extradite_performance_benchmark.py --repetitions 5 --cases callback_chatter --json-output /tmp/extradite-phase4-after.json
+```
+
+Extradite median `us/op` before vs after:
+
+| Regime | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `callback_chatter` | 915.248 | 225.853 | -75.32% |
+
+Summary:
+
+- `callback_chatter` improved by over 4x, exceeding the phase target.
 
 ---
 
