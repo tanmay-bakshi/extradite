@@ -67,16 +67,34 @@ This prevents protected-module leakage through marshal/unmarshal transfer paths.
 
 ## API
 
-### `extradite(target: str, share_key: str | None = None, transport_policy: str = "value") -> type`
+### `extradite(target: str, share_key: str | None = None, transport_policy: str = "value", transport_type_rules: dict[type, str] | None = None) -> type`
 
 - `target` format: `"module.path:ClassName"`.
 - `share_key` is optional; when provided, calls with the same key reuse one backing child process.
 - `transport_policy` controls picklable-value transport behavior:
   - `"value"` (default): transfer picklable values by copy.
   - `"reference"`: force handle transport for non-scalar values, preserving identity.
+- `transport_type_rules` defines optional type-based defaults, e.g. `{type: "reference"}` or `{types.FunctionType: "reference"}`.
 - returns a dynamic proxy class.
 - constructing that proxy creates remote instances in the child process.
 - default behavior is unchanged: without `share_key`, each call gets its own child process.
+
+### Policy precedence
+
+Policy resolution for each encoded value uses strict precedence:
+
+1. explicit per-call override (`__extradite_policy__` keyword on proxy calls)
+2. matching `transport_type_rules` entry
+3. session default `transport_policy`
+
+### Policy introspection
+
+Proxy classes and instances expose:
+
+- `get_effective_policy(value, call_policy: str | None = None) -> str`
+- `get_effective_policy_trace(value, call_policy: str | None = None) -> dict`
+
+`get_effective_policy_trace` returns the chosen policy, source (`call_override`, `type_rule`, or `session_default`), and matched type name when applicable.
 
 ## Re-entrant callbacks
 
@@ -127,6 +145,7 @@ These preserve the original remote exception type, message, and traceback text.
 - Some advanced Python interactions may be unsupported and raise `UnsupportedInteractionError`.
 - If you use `share_key`, `Class.close()` releases that class handle; the shared child process exits when the last handle for that key is closed.
 - If you reuse a `share_key`, all calls must use the same `transport_policy`.
+- If you reuse a `share_key`, all calls must also use the same `transport_type_rules` configuration and ordering.
 - Handle proxies support explicit `close()` and deterministic use-after-release protocol errors.
 
 ## Running tests

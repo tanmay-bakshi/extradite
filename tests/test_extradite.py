@@ -48,6 +48,19 @@ class DerivedLocalClass(BaseLocalClass):
     """Derived class used for class-handle semantics tests."""
 
 
+class AlternatePayload:
+    """Picklable payload class used for policy-fallback tests."""
+
+    value: int
+
+    def __init__(self, value: int) -> None:
+        """Initialize payload.
+
+        :param value: Stored value.
+        """
+        self.value = value
+
+
 def _purge_module(module_name: str) -> None:
     """Remove a module tree from ``sys.modules``.
 
@@ -341,6 +354,120 @@ def test_share_key_rejects_conflicting_transport_policy() -> None:
             extradite(TARGET, share_key=share_key, transport_policy="reference")
     finally:
         counter_cls.close()
+
+
+def test_share_key_rejects_conflicting_transport_type_rules() -> None:
+    """A shared session key must not mix conflicting per-type rules."""
+    share_key: str = "type-rule-conflict"
+    counter_cls: type = extradite(
+        TARGET,
+        share_key=share_key,
+        transport_policy="value",
+        transport_type_rules={PicklablePayload: "reference"},
+    )
+    try:
+        with pytest.raises(ValueError, match="transport_type_rules"):
+            extradite(
+                TARGET,
+                share_key=share_key,
+                transport_policy="value",
+                transport_type_rules={AlternatePayload: "reference"},
+            )
+    finally:
+        counter_cls.close()
+
+
+def test_policy_precedence_call_override_then_type_then_session() -> None:
+    """Validate precedence: per-call override > per-type rule > session default."""
+    counter_cls: type = extradite(
+        TARGET,
+        transport_policy="value",
+        transport_type_rules={PicklablePayload: "reference"},
+    )
+    counter = None
+    try:
+        counter = counter_cls(1)
+
+        type_rule_payload = PicklablePayload(1)
+        type_rule_result: object = counter.echo(type_rule_payload)
+        assert type_rule_result is type_rule_payload
+
+        call_override_payload = PicklablePayload(2)
+        call_override_result: object = counter.echo(
+            call_override_payload,
+            __extradite_policy__="value",
+        )
+        assert call_override_result is not call_override_payload
+        assert isinstance(call_override_result, PicklablePayload) is True
+        assert call_override_result.value == call_override_payload.value
+
+        fallback_payload = AlternatePayload(3)
+        fallback_result: object = counter.echo(fallback_payload)
+        assert fallback_result is not fallback_payload
+        assert isinstance(fallback_result, AlternatePayload) is True
+        assert fallback_result.value == fallback_payload.value
+
+        explicit_reference_payload = AlternatePayload(4)
+        explicit_reference_result: object = counter.echo(
+            explicit_reference_payload,
+            __extradite_policy__="reference",
+        )
+        assert explicit_reference_result is explicit_reference_payload
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_get_effective_policy_trace_precedence_and_fallback() -> None:
+    """Verify effective-policy tracing for override, type-rule, and fallback cases."""
+    counter_cls: type = extradite(
+        TARGET,
+        transport_policy="value",
+        transport_type_rules={PicklablePayload: "reference"},
+    )
+    counter = None
+    try:
+        counter = counter_cls(1)
+
+        from_type_rule: str = counter_cls.get_effective_policy(PicklablePayload(1))
+        assert from_type_rule == "reference"
+
+        type_trace: dict[str, str | None] = counter_cls.get_effective_policy_trace(PicklablePayload(1))
+        assert type_trace["effective_policy"] == "reference"
+        assert type_trace["source"] == "type_rule"
+        assert type_trace["matched_type"] == f"{PicklablePayload.__module__}.{PicklablePayload.__qualname__}"
+
+        override_trace: dict[str, str | None] = counter.get_effective_policy_trace(
+            PicklablePayload(2),
+            call_policy="value",
+        )
+        assert override_trace["effective_policy"] == "value"
+        assert override_trace["source"] == "call_override"
+        assert override_trace["matched_type"] is None
+
+        fallback_trace: dict[str, str | None] = counter.get_effective_policy_trace(AlternatePayload(3))
+        assert fallback_trace["effective_policy"] == "value"
+        assert fallback_trace["source"] == "session_default"
+        assert fallback_trace["matched_type"] is None
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_invalid_transport_type_rules_fail_fast() -> None:
+    """Invalid per-type rules should fail fast during proxy creation."""
+    with pytest.raises(TypeError, match="transport_type_rules keys must be type objects"):
+        extradite(  # type: ignore[arg-type]
+            TARGET,
+            transport_type_rules={"not-a-type": "reference"},
+        )
+    with pytest.raises(ValueError, match="transport_policy"):
+        extradite(
+            TARGET,
+            transport_type_rules={PicklablePayload: "bad-policy"},
+        )
 
 
 def test_callback_roundtrip_reentrant() -> None:

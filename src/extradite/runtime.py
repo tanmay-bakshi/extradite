@@ -27,6 +27,8 @@ from extradite.worker import worker_entry
 _SHARED_SESSION_LOCK: threading.RLock = threading.RLock()
 _SHARED_SESSIONS_BY_KEY: dict[str, "ExtraditeSession"] = {}
 TransportPolicy = Literal["value", "reference"]
+PolicySource = Literal["call_override", "type_rule", "session_default"]
+CALL_POLICY_KWARG: str = "__extradite_policy__"
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -158,6 +160,103 @@ def _validate_transport_policy(transport_policy: str) -> TransportPolicy:
     raise ValueError("transport_policy must be one of: reference, value")
 
 
+def _extract_call_policy(kwargs: dict[str, object]) -> TransportPolicy | None:
+    """Extract and validate a per-call policy override from kwargs.
+
+    :param kwargs: Mutable keyword-argument dictionary.
+    :returns: Validated per-call policy or ``None``.
+    :raises ValueError: If override value is not a valid policy string.
+    """
+    has_override: bool = CALL_POLICY_KWARG in kwargs
+    if has_override is False:
+        return None
+
+    override_obj: object = kwargs.pop(CALL_POLICY_KWARG)
+    if isinstance(override_obj, str) is False:
+        raise ValueError(f"{CALL_POLICY_KWARG} must be a string policy name")
+    return _validate_transport_policy(override_obj)
+
+
+def _normalize_transport_type_rules(
+    transport_type_rules: dict[type[object], str] | None,
+) -> list[tuple[type[object], TransportPolicy]]:
+    """Validate and normalize per-type transport rules.
+
+    :param transport_type_rules: Optional mapping of ``type -> policy``.
+    :returns: Ordered normalized rule list.
+    :raises TypeError: If rule keys are not type objects.
+    :raises ValueError: If a policy value is unsupported.
+    """
+    if transport_type_rules is None:
+        return []
+
+    normalized: list[tuple[type[object], TransportPolicy]] = []
+    for candidate_type, policy_name in transport_type_rules.items():
+        if isinstance(candidate_type, type) is False:
+            raise TypeError("transport_type_rules keys must be type objects")
+        normalized_policy: TransportPolicy = _validate_transport_policy(policy_name)
+        normalized.append((candidate_type, normalized_policy))
+    return normalized
+
+
+def _type_name(type_object: type[object]) -> str:
+    """Build a stable dotted name for a type object.
+
+    :param type_object: Type object.
+    :returns: Dotted ``module.qualname`` string.
+    """
+    module_name: str = type_object.__module__
+    qualname: str = type_object.__qualname__
+    return f"{module_name}.{qualname}"
+
+
+def _match_transport_rule(
+    value: object,
+    transport_type_rules: list[tuple[type[object], TransportPolicy]],
+) -> tuple[TransportPolicy | None, type[object] | None]:
+    """Resolve the best matching per-type policy rule for ``value``.
+
+    Rules are matched using ``isinstance`` semantics and ranked by MRO distance.
+    Lower distance wins; ties preserve rule declaration order.
+
+    :param value: Candidate runtime value.
+    :param transport_type_rules: Ordered ``(type, policy)`` rules.
+    :returns: Tuple of ``(policy, matched_type)`` when matched, otherwise ``(None, None)``.
+    """
+    value_type: type[object] = type(value)
+    best_policy: TransportPolicy | None = None
+    best_type: type[object] | None = None
+    best_distance: int | None = None
+
+    for candidate_type, policy_name in transport_type_rules:
+        matches: bool = isinstance(value, candidate_type)
+        if matches is False:
+            continue
+
+        mro: tuple[type[object], ...] = value_type.__mro__
+        candidate_distance: int | None = None
+        for index, entry in enumerate(mro):
+            if entry is candidate_type:
+                candidate_distance = index
+                break
+
+        if candidate_distance is None:
+            candidate_distance = len(mro)
+
+        if best_distance is None:
+            best_distance = candidate_distance
+            best_policy = policy_name
+            best_type = candidate_type
+            continue
+
+        if candidate_distance < best_distance:
+            best_distance = candidate_distance
+            best_policy = policy_name
+            best_type = candidate_type
+
+    return best_policy, best_type
+
+
 def _is_force_reference_candidate(value: object) -> bool:
     """Decide whether policy ``reference`` should force handle transport.
 
@@ -267,11 +366,13 @@ class _RemoteCallProxy:
         :param kwargs: Keyword arguments.
         :returns: Decoded remote result.
         """
+        call_policy: TransportPolicy | None = _extract_call_policy(kwargs)
         return self._session.call_attr(
             self._object_id,
             self._attr_name,
             list(args),
             kwargs,
+            call_policy=call_policy,
         )
 
 
@@ -532,12 +633,32 @@ class _RemoteProxyOps:
         :param kwargs: Keyword arguments.
         :returns: Remote call result.
         """
+        call_policy: TransportPolicy | None = _extract_call_policy(kwargs)
         return self._session.call_attr(
             self._remote_object_id,
             "__call__",
             list(args),
             kwargs,
+            call_policy=call_policy,
         )
+
+    def get_effective_policy(self, value: object, call_policy: str | None = None) -> TransportPolicy:
+        """Return the effective policy used for encoding ``value``.
+
+        :param value: Candidate runtime value.
+        :param call_policy: Optional per-call override to evaluate.
+        :returns: Effective transport policy.
+        """
+        return self._session.get_effective_policy(value, call_policy=call_policy)
+
+    def get_effective_policy_trace(self, value: object, call_policy: str | None = None) -> dict[str, str | None]:
+        """Return a trace describing effective-policy resolution.
+
+        :param value: Candidate runtime value.
+        :param call_policy: Optional per-call override to evaluate.
+        :returns: Trace with effective policy and precedence source.
+        """
+        return self._session.get_effective_policy_trace(value, call_policy=call_policy)
 
     def __enter__(self) -> object:
         """Enter remote context manager.
@@ -588,7 +709,13 @@ class ExtraditedMeta(type):
         """
         session: ExtraditeSession = cls._session
         class_object_id: int = cls._class_object_id
-        object_id: int = session.construct_instance(class_object_id, list(args), kwargs)
+        call_policy: TransportPolicy | None = _extract_call_policy(kwargs)
+        object_id: int = session.construct_instance(
+            class_object_id,
+            list(args),
+            kwargs,
+            call_policy=call_policy,
+        )
         return session.get_or_create_instance_proxy(object_id, cls)
 
     def __getattribute__(cls, attr_name: str) -> object:
@@ -601,6 +728,12 @@ class ExtraditedMeta(type):
             session: ExtraditeSession = type.__getattribute__(cls, "_session")
             remote_target: str = type.__getattribute__(cls, "_remote_target")
             return _ClassCloseProxy(session, remote_target)
+        if attr_name == "get_effective_policy":
+            session = type.__getattribute__(cls, "_session")
+            return session.get_effective_policy
+        if attr_name == "get_effective_policy_trace":
+            session = type.__getattribute__(cls, "_session")
+            return session.get_effective_policy_trace
         return super().__getattribute__(attr_name)
 
     def __getattr__(cls, attr_name: str) -> object:
@@ -671,6 +804,8 @@ class ExtraditeSession:
 
     _share_key: str | None
     _transport_policy: TransportPolicy
+    _transport_type_rules: list[tuple[type[object], TransportPolicy]]
+    _transport_type_rule_signature: tuple[tuple[type[object], TransportPolicy], ...]
     _close_callback: Callable[[], None] | None
     _connection: Connection | None
     _process: multiprocessing.Process | None
@@ -689,15 +824,22 @@ class ExtraditeSession:
         share_key: str | None = None,
         close_callback: Callable[[], None] | None = None,
         transport_policy: TransportPolicy = "value",
+        transport_type_rules: list[tuple[type[object], TransportPolicy]] | None = None,
     ) -> None:
         """Initialize a session.
 
         :param share_key: Optional share key used by the session registry.
         :param close_callback: Optional callback invoked once when the session closes.
         :param transport_policy: Wire transport policy for picklable values.
+        :param transport_type_rules: Optional per-type transport rules.
         """
         self._share_key = share_key
         self._transport_policy = transport_policy
+        if transport_type_rules is None:
+            self._transport_type_rules = []
+        else:
+            self._transport_type_rules = list(transport_type_rules)
+        self._transport_type_rule_signature = tuple(self._transport_type_rules)
         self._close_callback = close_callback
         self._connection = None
         self._process = None
@@ -954,10 +1096,78 @@ class ExtraditeSession:
 
         return value
 
-    def _encode_for_child(self, value: object) -> object:
+    def _resolve_effective_policy(
+        self,
+        value: object,
+        call_policy: str | None = None,
+    ) -> tuple[TransportPolicy, PolicySource, type[object] | None]:
+        """Resolve effective transport policy for one value.
+
+        Precedence order:
+        1. Explicit per-call override.
+        2. Per-type rule.
+        3. Session default.
+
+        :param value: Candidate runtime value.
+        :param call_policy: Optional per-call override.
+        :returns: Tuple of policy, source, and matched type.
+        """
+        if call_policy is not None:
+            call_policy_normalized: TransportPolicy = _validate_transport_policy(call_policy)
+            return call_policy_normalized, "call_override", None
+
+        matched_policy, matched_type = _match_transport_rule(value, self._transport_type_rules)
+        if matched_policy is not None:
+            return matched_policy, "type_rule", matched_type
+
+        return self._transport_policy, "session_default", None
+
+    def get_effective_policy(self, value: object, call_policy: str | None = None) -> TransportPolicy:
+        """Return the effective policy for encoding ``value``.
+
+        :param value: Candidate runtime value.
+        :param call_policy: Optional per-call override.
+        :returns: Effective transport policy.
+        """
+        effective_policy: TransportPolicy
+        source: PolicySource
+        matched_type: type[object] | None
+        effective_policy, source, matched_type = self._resolve_effective_policy(
+            value,
+            call_policy=call_policy,
+        )
+        _ = source
+        _ = matched_type
+        return effective_policy
+
+    def get_effective_policy_trace(self, value: object, call_policy: str | None = None) -> dict[str, str | None]:
+        """Return a trace describing policy precedence for ``value``.
+
+        :param value: Candidate runtime value.
+        :param call_policy: Optional per-call override.
+        :returns: Trace with effective policy, source, and matched type.
+        """
+        effective_policy: TransportPolicy
+        source: PolicySource
+        matched_type: type[object] | None
+        effective_policy, source, matched_type = self._resolve_effective_policy(
+            value,
+            call_policy=call_policy,
+        )
+        matched_type_name: str | None = None
+        if matched_type is not None:
+            matched_type_name = _type_name(matched_type)
+        return {
+            "effective_policy": effective_policy,
+            "source": source,
+            "matched_type": matched_type_name,
+        }
+
+    def _encode_for_child(self, value: object, call_policy: str | None = None) -> object:
         """Encode one runtime value for transport to the child.
 
         :param value: Runtime value.
+        :param call_policy: Optional per-call override.
         :returns: Wire value.
         :raises UnsupportedInteractionError: If transfer cannot be performed safely.
         """
@@ -977,8 +1187,17 @@ class ExtraditeSession:
                 )
             return (WIRE_REF_TAG, OWNER_CHILD, value.remote_object_id)
 
+        effective_policy: TransportPolicy
+        source: PolicySource
+        matched_type: type[object] | None
+        effective_policy, source, matched_type = self._resolve_effective_policy(
+            value,
+            call_policy=call_policy,
+        )
+        _ = source
+        _ = matched_type
         force_reference: bool = (
-            self._transport_policy == "reference"
+            effective_policy == "reference"
             and _is_force_reference_candidate(value) is True
         )
         if force_reference is True:
@@ -986,34 +1205,34 @@ class ExtraditeSession:
             return (WIRE_REF_TAG, OWNER_PARENT, object_id_force_ref)
 
         if isinstance(value, list) is True:
-            return [self._encode_for_child(item) for item in value]
+            return [self._encode_for_child(item, call_policy=call_policy) for item in value]
 
         if isinstance(value, tuple) is True:
-            return tuple(self._encode_for_child(item) for item in value)
+            return tuple(self._encode_for_child(item, call_policy=call_policy) for item in value)
 
         if isinstance(value, set) is True:
             encoded_items: set[object] = set()
             for item in value:
-                encoded_item: object = self._encode_for_child(item)
+                encoded_item: object = self._encode_for_child(item, call_policy=call_policy)
                 encoded_items.add(encoded_item)
             return encoded_items
 
         if isinstance(value, frozenset) is True:
             encoded_frozen_items: set[object] = set()
             for item in value:
-                encoded_item = self._encode_for_child(item)
+                encoded_item = self._encode_for_child(item, call_policy=call_policy)
                 encoded_frozen_items.add(encoded_item)
             return frozenset(encoded_frozen_items)
 
         if isinstance(value, dict) is True:
             encoded_dict: dict[object, object] = {}
             for key, item in value.items():
-                encoded_key: object = self._encode_for_child(key)
+                encoded_key: object = self._encode_for_child(key, call_policy=call_policy)
                 try:
                     hash(encoded_key)
                 except TypeError as exc:
                     raise UnsupportedInteractionError("Encoded dict keys must stay hashable") from exc
-                encoded_item: object = self._encode_for_child(item)
+                encoded_item: object = self._encode_for_child(item, call_policy=call_policy)
                 encoded_dict[encoded_key] = encoded_item
             return encoded_dict
 
@@ -1259,18 +1478,28 @@ class ExtraditeSession:
 
             return self._wait_for_response(expected_request_id=request_id)
 
-    def construct_instance(self, class_object_id: int, args: list[object], kwargs: dict[str, object]) -> int:
+    def construct_instance(
+        self,
+        class_object_id: int,
+        args: list[object],
+        kwargs: dict[str, object],
+        call_policy: str | None = None,
+    ) -> int:
         """Construct a remote class instance.
 
         :param class_object_id: Remote class object identifier.
         :param args: Constructor positional arguments.
         :param kwargs: Constructor keyword arguments.
+        :param call_policy: Optional per-call override.
         :returns: Remote object identifier.
         """
-        encoded_args: list[object] = [self._encode_for_child(item) for item in args]
+        encoded_args: list[object] = [
+            self._encode_for_child(item, call_policy=call_policy)
+            for item in args
+        ]
         encoded_kwargs: dict[str, object] = {}
         for key, value in kwargs.items():
-            encoded_kwargs[key] = self._encode_for_child(value)
+            encoded_kwargs[key] = self._encode_for_child(value, call_policy=call_policy)
 
         response: dict[str, object] = self._send_request(
             "construct",
@@ -1324,6 +1553,7 @@ class ExtraditeSession:
         attr_name: str,
         args: list[object],
         kwargs: dict[str, object],
+        call_policy: str | None = None,
     ) -> object:
         """Call a callable attribute on a remote object.
 
@@ -1331,12 +1561,16 @@ class ExtraditeSession:
         :param attr_name: Callable attribute name.
         :param args: Positional arguments.
         :param kwargs: Keyword arguments.
+        :param call_policy: Optional per-call override.
         :returns: Decoded call result.
         """
-        encoded_args: list[object] = [self._encode_for_child(item) for item in args]
+        encoded_args: list[object] = [
+            self._encode_for_child(item, call_policy=call_policy)
+            for item in args
+        ]
         encoded_kwargs: dict[str, object] = {}
         for key, value in kwargs.items():
-            encoded_kwargs[key] = self._encode_for_child(value)
+            encoded_kwargs[key] = self._encode_for_child(value, call_policy=call_policy)
 
         response: dict[str, object] = self._send_request(
             "call_attr",
@@ -1355,14 +1589,21 @@ class ExtraditeSession:
         encoded_value: object = payload.get("value")
         return self._decode_from_child(encoded_value)
 
-    def set_attr(self, object_id: int, attr_name: str, value: object) -> None:
+    def set_attr(
+        self,
+        object_id: int,
+        attr_name: str,
+        value: object,
+        call_policy: str | None = None,
+    ) -> None:
         """Set an attribute on a remote object.
 
         :param object_id: Remote object identifier.
         :param attr_name: Attribute name.
         :param value: New value.
+        :param call_policy: Optional per-call override.
         """
-        encoded_value: object = self._encode_for_child(value)
+        encoded_value: object = self._encode_for_child(value, call_policy=call_policy)
         self._send_request(
             "set_attr",
             {
@@ -1509,13 +1750,15 @@ def _remove_shared_session_if_current(share_key: str, session: ExtraditeSession)
 def _get_or_create_shared_session(
     share_key: str,
     transport_policy: TransportPolicy,
+    transport_type_rules: list[tuple[type[object], TransportPolicy]],
 ) -> tuple[ExtraditeSession, bool]:
     """Get or create a shared session for ``share_key``.
 
     :param share_key: Shared-session key.
     :param transport_policy: Requested transport policy.
+    :param transport_type_rules: Requested per-type transport rules.
     :returns: Tuple of ``(session, was_created)``.
-    :raises ValueError: If an active shared session has a conflicting policy.
+    :raises ValueError: If an active shared session has conflicting policy settings.
     """
     with _SHARED_SESSION_LOCK:
         existing: ExtraditeSession | None = _SHARED_SESSIONS_BY_KEY.get(share_key)
@@ -1528,6 +1771,14 @@ def _get_or_create_shared_session(
                         "share_key already exists with transport_policy="
                         + f"{existing._transport_policy!r}; requested {transport_policy!r}"
                     )
+                same_type_rules: bool = (
+                    existing._transport_type_rule_signature
+                    == tuple(transport_type_rules)
+                )
+                if same_type_rules is False:
+                    raise ValueError(
+                        "share_key already exists with conflicting transport_type_rules"
+                    )
                 return existing, False
             _SHARED_SESSIONS_BY_KEY.pop(share_key, None)
 
@@ -1535,6 +1786,7 @@ def _get_or_create_shared_session(
             share_key=share_key,
             close_callback=lambda: _remove_shared_session_if_current(share_key, session),
             transport_policy=transport_policy,
+            transport_type_rules=transport_type_rules,
         )
         _SHARED_SESSIONS_BY_KEY[share_key] = session
         return session, True
@@ -1571,26 +1823,35 @@ def create_extradited_class(
     target: str,
     share_key: str | None = None,
     transport_policy: TransportPolicy = "value",
+    transport_type_rules: dict[type[object], str] | None = None,
 ) -> type:
     """Create a class proxy for an isolated import target.
 
     :param target: Target in ``module.path:ClassName`` format.
     :param share_key: Optional key that reuses a child process across calls.
     :param transport_policy: Wire transport policy for picklable values.
+    :param transport_type_rules: Optional per-type transport rules.
     :returns: Dynamic proxy class for that target.
     :raises ExtraditeModuleLeakError: If target module already leaked into root process.
     """
     validated_transport_policy: TransportPolicy = _validate_transport_policy(transport_policy)
+    normalized_transport_type_rules: list[tuple[type[object], TransportPolicy]] = _normalize_transport_type_rules(
+        transport_type_rules
+    )
     module_name, class_qualname = _parse_target(target)
     session: ExtraditeSession
     is_new_session: bool
     if share_key is None:
-        session = ExtraditeSession(transport_policy=validated_transport_policy)
+        session = ExtraditeSession(
+            transport_policy=validated_transport_policy,
+            transport_type_rules=normalized_transport_type_rules,
+        )
         is_new_session = True
     else:
         session, is_new_session = _get_or_create_shared_session(
             share_key,
             validated_transport_policy,
+            normalized_transport_type_rules,
         )
 
     try:
