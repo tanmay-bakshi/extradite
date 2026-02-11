@@ -3,12 +3,17 @@
 import importlib
 import pickle
 import traceback
+import weakref
 from multiprocessing.connection import Connection
+from typing import Any
 
 from extradite.errors import ExtraditeProtocolError
 from extradite.errors import UnsupportedInteractionError
 
-REMOTE_REF_KEY: str = "__extradite_remote_ref__"
+WIRE_PICKLE_TAG: str = "__extradite_transport_pickle_v1__"
+WIRE_REF_TAG: str = "__extradite_transport_ref_v1__"
+OWNER_PARENT: str = "parent"
+OWNER_CHILD: str = "child"
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -44,7 +49,7 @@ def _value_originates_from_module(
     protected_module_names: set[str],
     seen_ids: set[int],
 ) -> bool:
-    """Recursively detect references to values from the protected module.
+    """Recursively detect references to values from protected modules.
 
     :param value: Value to inspect.
     :param protected_module_names: Protected module roots.
@@ -118,7 +123,8 @@ def _value_originates_from_module(
         slot_names = [name for name in slots if isinstance(name, str) is True]
 
     for slot_name in slot_names:
-        if hasattr(value, slot_name) is False:
+        has_slot: bool = hasattr(value, slot_name)
+        if has_slot is False:
             continue
         slot_value: object = getattr(value, slot_name)
         slot_is_protected: bool = _value_originates_from_module(slot_value, protected_module_names, seen_ids)
@@ -129,7 +135,7 @@ def _value_originates_from_module(
 
 
 class ObjectRegistry:
-    """Store child-process objects under stable integer identifiers."""
+    """Store worker-side objects under stable integer identifiers."""
 
     _by_object_id: dict[int, object]
     _by_identity: dict[int, int]
@@ -170,12 +176,12 @@ class ObjectRegistry:
 
         :param object_id: Identifier of the object.
         :returns: Stored object.
-        :raises ExtraditeProtocolError: If the identifier is unknown.
+        :raises ExtraditeProtocolError: If the identifier is unknown or released.
         """
-        value: object | None = self._by_object_id.get(object_id)
-        if value is None:
-            raise ExtraditeProtocolError(f"Unknown remote object id: {object_id}")
-        return value
+        exists: bool = object_id in self._by_object_id
+        if exists is False:
+            raise ExtraditeProtocolError(f"Unknown or released remote object id: {object_id}")
+        return self._by_object_id[object_id]
 
     def release(self, object_id: int) -> None:
         """Release an object unless pinned.
@@ -186,12 +192,48 @@ class ObjectRegistry:
         if is_pinned is True:
             return
 
-        value: object | None = self._by_object_id.pop(object_id, None)
-        if value is None:
+        exists: bool = object_id in self._by_object_id
+        if exists is False:
             return
 
+        value: object = self._by_object_id.pop(object_id)
         identity: int = id(value)
         self._by_identity.pop(identity, None)
+
+    def clear(self) -> None:
+        """Clear all stored objects."""
+        self._by_object_id.clear()
+        self._by_identity.clear()
+        self._pinned_object_ids.clear()
+
+
+class _RemotePeerError(Exception):
+    """Carry remote exception details across nested request boundaries."""
+
+    remote_type_name: str
+    remote_message: str
+    remote_traceback: str
+
+    def __init__(
+        self,
+        remote_type_name: str,
+        remote_message: str,
+        remote_traceback: str,
+    ) -> None:
+        """Initialize a remote peer error value.
+
+        :param remote_type_name: Remote exception type name.
+        :param remote_message: Remote exception message.
+        :param remote_traceback: Remote exception traceback text.
+        """
+        self.remote_type_name = remote_type_name
+        self.remote_message = remote_message
+        self.remote_traceback = remote_traceback
+        message: str = (
+            f"Remote side raised {remote_type_name}: {remote_message}\n"
+            + f"Remote traceback:\n{remote_traceback}"
+        )
+        super().__init__(message)
 
 
 def _send_ok(connection: Connection, request_id: int, payload: dict[str, object]) -> None:
@@ -234,83 +276,6 @@ def _send_error(connection: Connection, request_id: int, error_type: str, error_
         connection.send(message)
     except (BrokenPipeError, EOFError, OSError):
         return
-
-
-def _is_remote_ref_payload(value: object) -> bool:
-    """Check whether a value represents a remote object reference.
-
-    :param value: Candidate value.
-    :returns: ``True`` if it is a valid remote-reference payload.
-    """
-    if isinstance(value, dict) is False:
-        return False
-    if len(value) != 1:
-        return False
-    has_key: bool = REMOTE_REF_KEY in value
-    if has_key is False:
-        return False
-    object_id: object = value[REMOTE_REF_KEY]
-    if isinstance(object_id, int) is False:
-        return False
-    return True
-
-
-def _decode_value(value: object, registry: ObjectRegistry) -> object:
-    """Decode a parent-provided argument for local execution.
-
-    :param value: Encoded value.
-    :param registry: Child-process registry.
-    :returns: Decoded runtime value.
-    """
-    is_ref: bool = _is_remote_ref_payload(value)
-    if is_ref is True:
-        payload: dict[str, object] = value  # type: ignore[assignment]
-        object_id: int = payload[REMOTE_REF_KEY]  # type: ignore[assignment]
-        return registry.get(object_id)
-
-    if isinstance(value, list) is True:
-        return [_decode_value(item, registry) for item in value]
-
-    if isinstance(value, tuple) is True:
-        return tuple(_decode_value(item, registry) for item in value)
-
-    if isinstance(value, set) is True:
-        return {_decode_value(item, registry) for item in value}
-
-    if isinstance(value, dict) is True:
-        decoded: dict[object, object] = {}
-        for key, item in value.items():
-            decoded_key: object = _decode_value(key, registry)
-            decoded_item: object = _decode_value(item, registry)
-            decoded[decoded_key] = decoded_item
-        return decoded
-
-    return value
-
-
-def _encode_value(value: object, protected_module_names: set[str]) -> dict[str, object]:
-    """Encode a local value for transfer back to the parent.
-
-    :param value: Runtime value.
-    :param protected_module_names: Protected module roots.
-    :returns: Encoded value payload containing pickle bytes.
-    :raises UnsupportedInteractionError: If transfer is disallowed.
-    """
-    seen_ids: set[int] = set()
-    contains_protected: bool = _value_originates_from_module(value, protected_module_names, seen_ids)
-    if contains_protected is True:
-        raise UnsupportedInteractionError(
-            "Refusing to transfer values that originate from the protected isolated module"
-        )
-
-    try:
-        payload: bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-    except (pickle.PicklingError, TypeError, AttributeError, ValueError) as exc:
-        raise UnsupportedInteractionError(
-            "Refusing to transfer unpicklable return value across the barrier"
-        ) from exc
-
-    return {"kind": "pickle", "payload": payload}
 
 
 def _resolve_qualname(root: object, qualname: str) -> object:
@@ -381,113 +346,865 @@ def _require_str_field(message: dict[str, object], key: str) -> str:
     return value
 
 
-def _decode_args(message: dict[str, object], registry: ObjectRegistry) -> tuple[list[object], dict[str, object]]:
-    """Decode ``args`` and ``kwargs`` from a request message.
+def _finalize_parent_object(runtime_ref: "weakref.ReferenceType[WorkerRuntime]", object_id: int) -> None:
+    """Finalize one parent-owned remote handle proxy.
 
-    :param message: Request message.
-    :param registry: Child-process object registry.
-    :returns: Decoded positional and keyword arguments.
-    :raises ExtraditeProtocolError: If argument payload types are invalid.
+    :param runtime_ref: Weak reference to runtime.
+    :param object_id: Parent-owned object identifier.
     """
-    raw_args: object = message.get("args", [])
-    if isinstance(raw_args, list) is False:
-        raise ExtraditeProtocolError("args must be a list")
-
-    raw_kwargs: object = message.get("kwargs", {})
-    if isinstance(raw_kwargs, dict) is False:
-        raise ExtraditeProtocolError("kwargs must be a dict")
-
-    args: list[object] = [_decode_value(item, registry) for item in raw_args]
-    kwargs: dict[str, object] = {}
-    for key, item in raw_kwargs.items():
-        if isinstance(key, str) is False:
-            raise ExtraditeProtocolError("kwargs keys must be strings")
-        kwargs[key] = _decode_value(item, registry)
-    return args, kwargs
+    runtime: WorkerRuntime | None = runtime_ref()
+    if runtime is None:
+        return
+    runtime.release_parent_object_safely(object_id)
 
 
-def _handle_request(
-    message: dict[str, object],
-    registry: ObjectRegistry,
-    protected_module_names: set[str],
-) -> dict[str, object]:
-    """Handle a single request.
+class _ParentCallProxy:
+    """Call wrapper for parent-owned callable attributes."""
 
-    :param message: Request message.
-    :param registry: Child-process object registry.
-    :param protected_module_names: Protected module roots.
-    :returns: Success payload.
-    :raises ExtraditeProtocolError: If the request is malformed.
-    """
-    action: str = _require_action(message)
+    _runtime: "WorkerRuntime"
+    _object_id: int
+    _attr_name: str
 
-    if action == "load_class":
-        module_name: str = _require_str_field(message, "module_name")
-        class_qualname: str = _require_str_field(message, "class_qualname")
-        imported_module = importlib.import_module(module_name)
-        class_object: object = _resolve_qualname(imported_module, class_qualname)
-        is_type: bool = isinstance(class_object, type)
-        if is_type is False:
-            raise ExtraditeProtocolError(f"Target {module_name}:{class_qualname} is not a class")
-        class_object_id: int = registry.store(class_object, pinned=True)
-        protected_module_names.add(module_name)
-        return {"class_object_id": class_object_id}
+    def __init__(self, runtime: "WorkerRuntime", object_id: int, attr_name: str) -> None:
+        """Initialize a parent call wrapper.
 
-    if action == "construct":
-        class_object_id: int = _require_int_field(message, "class_object_id")
-        args, kwargs = _decode_args(message, registry)
-        class_object: object = registry.get(class_object_id)
-        instance: object = class_object(*args, **kwargs)  # type: ignore[operator]
-        object_id: int = registry.store(instance)
-        return {"object_id": object_id}
+        :param runtime: Worker runtime.
+        :param object_id: Parent-owned object identifier.
+        :param attr_name: Attribute to call.
+        """
+        self._runtime = runtime
+        self._object_id = object_id
+        self._attr_name = attr_name
 
-    if action == "get_attr":
-        object_id = _require_int_field(message, "object_id")
-        attr_name = _require_str_field(message, "attr_name")
-        target: object = registry.get(object_id)
-        attr_value: object = getattr(target, attr_name)
-        is_callable: bool = callable(attr_value)
-        if is_callable is True:
-            return {"callable": True}
-        return {"callable": False, "value": _encode_value(attr_value, protected_module_names)}
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        """Invoke the wrapped parent callable attribute.
 
-    if action == "set_attr":
-        object_id = _require_int_field(message, "object_id")
-        attr_name = _require_str_field(message, "attr_name")
-        raw_value: object = message.get("value")
-        value: object = _decode_value(raw_value, registry)
-        target = registry.get(object_id)
-        setattr(target, attr_name, value)
-        return {}
+        :param args: Positional arguments.
+        :param kwargs: Keyword arguments.
+        :returns: Decoded parent response value.
+        """
+        return self._runtime.call_parent_attr(self._object_id, self._attr_name, list(args), kwargs)
 
-    if action == "del_attr":
-        object_id = _require_int_field(message, "object_id")
-        attr_name = _require_str_field(message, "attr_name")
-        target = registry.get(object_id)
-        delattr(target, attr_name)
-        return {}
 
-    if action == "call_attr":
-        object_id = _require_int_field(message, "object_id")
-        attr_name = _require_str_field(message, "attr_name")
-        args, kwargs = _decode_args(message, registry)
-        target = registry.get(object_id)
-        callable_obj: object = getattr(target, attr_name)
-        is_callable = callable(callable_obj)
-        if is_callable is False:
-            raise ExtraditeProtocolError(f"Attribute {attr_name!r} is not callable")
-        result: object = callable_obj(*args, **kwargs)  # type: ignore[operator]
-        return {"value": _encode_value(result, protected_module_names)}
+class _ParentRemoteHandle:
+    """Proxy object for a parent-owned handle exposed to the worker."""
 
-    if action == "release_object":
-        object_id = _require_int_field(message, "object_id")
-        registry.release(object_id)
-        return {}
+    _runtime: "WorkerRuntime"
+    _remote_object_id: int
+    _finalizer: weakref.finalize
 
-    if action == "shutdown":
-        return {"shutdown": True}
+    def __init__(self, runtime: "WorkerRuntime", object_id: int) -> None:
+        """Initialize a parent remote handle proxy.
 
-    raise ExtraditeProtocolError(f"Unsupported action: {action}")
+        :param runtime: Worker runtime.
+        :param object_id: Parent-owned object identifier.
+        """
+        object.__setattr__(self, "_runtime", runtime)
+        object.__setattr__(self, "_remote_object_id", object_id)
+        runtime_ref: "weakref.ReferenceType[WorkerRuntime]" = weakref.ref(runtime)
+        finalizer: weakref.finalize = weakref.finalize(self, _finalize_parent_object, runtime_ref, object_id)
+        object.__setattr__(self, "_finalizer", finalizer)
+
+    @property
+    def remote_object_id(self) -> int:
+        """Return the parent-owned object identifier.
+
+        :returns: Parent-owned object identifier.
+        """
+        return self._remote_object_id
+
+    def close(self) -> None:
+        """Release this parent-owned handle."""
+        was_alive: bool = self._finalizer.alive
+        if was_alive is True:
+            self._finalizer()
+
+    def __getattr__(self, attr_name: str) -> object:
+        """Resolve attributes from the parent process.
+
+        :param attr_name: Attribute name.
+        :returns: Remote attribute value or call proxy.
+        """
+        return self._runtime.get_parent_attr(self._remote_object_id, attr_name)
+
+    def __setattr__(self, attr_name: str, value: object) -> None:
+        """Set attributes in the parent process.
+
+        :param attr_name: Attribute name.
+        :param value: Attribute value.
+        """
+        is_internal: bool = attr_name.startswith("_")
+        if is_internal is True:
+            object.__setattr__(self, attr_name, value)
+            return
+        self._runtime.set_parent_attr(self._remote_object_id, attr_name, value)
+
+    def __delattr__(self, attr_name: str) -> None:
+        """Delete attributes in the parent process.
+
+        :param attr_name: Attribute name.
+        """
+        is_internal: bool = attr_name.startswith("_")
+        if is_internal is True:
+            object.__delattr__(self, attr_name)
+            return
+        self._runtime.del_parent_attr(self._remote_object_id, attr_name)
+
+    def _call_dunder(self, attr_name: str, *args: object) -> object:
+        """Call one dunder method on the parent-owned object.
+
+        :param attr_name: Dunder method name.
+        :param args: Dunder arguments.
+        :returns: Remote return value.
+        """
+        return self._runtime.call_parent_attr(self._remote_object_id, attr_name, list(args), {})
+
+    def __repr__(self) -> str:
+        """Return remote ``repr``.
+
+        :returns: Representation string.
+        """
+        value: object = self._call_dunder("__repr__")
+        if isinstance(value, str) is False:
+            raise ExtraditeProtocolError("Remote __repr__ did not return a string")
+        return value
+
+    def __str__(self) -> str:
+        """Return remote ``str``.
+
+        :returns: String value.
+        """
+        value: object = self._call_dunder("__str__")
+        if isinstance(value, str) is False:
+            raise ExtraditeProtocolError("Remote __str__ did not return a string")
+        return value
+
+    def __bytes__(self) -> bytes:
+        """Return remote ``bytes`` value.
+
+        :returns: Bytes value.
+        """
+        value: object = self._call_dunder("__bytes__")
+        if isinstance(value, bytes) is False:
+            raise ExtraditeProtocolError("Remote __bytes__ did not return bytes")
+        return value
+
+    def __bool__(self) -> bool:
+        """Return remote truth value.
+
+        :returns: Truth value.
+        """
+        value: object = self._call_dunder("__bool__")
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __bool__ did not return bool")
+        return value
+
+    def __len__(self) -> int:
+        """Return remote ``len`` value.
+
+        :returns: Integer length.
+        """
+        value: object = self._call_dunder("__len__")
+        if isinstance(value, int) is False:
+            raise ExtraditeProtocolError("Remote __len__ did not return int")
+        return value
+
+    def __iter__(self) -> object:
+        """Return remote iterator object.
+
+        :returns: Iterator object.
+        """
+        return self._call_dunder("__iter__")
+
+    def __next__(self) -> object:
+        """Return next remote iterator value.
+
+        :returns: Next value.
+        """
+        return self._call_dunder("__next__")
+
+    def __getitem__(self, key: object) -> object:
+        """Return one remote item.
+
+        :param key: Item key.
+        :returns: Item value.
+        """
+        return self._call_dunder("__getitem__", key)
+
+    def __setitem__(self, key: object, value: object) -> None:
+        """Set one remote item.
+
+        :param key: Item key.
+        :param value: Item value.
+        """
+        self._call_dunder("__setitem__", key, value)
+
+    def __delitem__(self, key: object) -> None:
+        """Delete one remote item.
+
+        :param key: Item key.
+        """
+        self._call_dunder("__delitem__", key)
+
+    def __contains__(self, item: object) -> bool:
+        """Evaluate remote ``in`` membership.
+
+        :param item: Candidate value.
+        :returns: Membership result.
+        """
+        value: object = self._call_dunder("__contains__", item)
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __contains__ did not return bool")
+        return value
+
+    def __eq__(self, other: object) -> bool:
+        """Evaluate remote equality.
+
+        :param other: Comparator value.
+        :returns: Equality result.
+        """
+        value: object = self._call_dunder("__eq__", other)
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __eq__ did not return bool")
+        return value
+
+    def __ne__(self, other: object) -> bool:
+        """Evaluate remote inequality.
+
+        :param other: Comparator value.
+        :returns: Inequality result.
+        """
+        value: object = self._call_dunder("__ne__", other)
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __ne__ did not return bool")
+        return value
+
+    def __lt__(self, other: object) -> bool:
+        """Evaluate remote less-than.
+
+        :param other: Comparator value.
+        :returns: Comparison result.
+        """
+        value: object = self._call_dunder("__lt__", other)
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __lt__ did not return bool")
+        return value
+
+    def __le__(self, other: object) -> bool:
+        """Evaluate remote less-or-equal.
+
+        :param other: Comparator value.
+        :returns: Comparison result.
+        """
+        value: object = self._call_dunder("__le__", other)
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __le__ did not return bool")
+        return value
+
+    def __gt__(self, other: object) -> bool:
+        """Evaluate remote greater-than.
+
+        :param other: Comparator value.
+        :returns: Comparison result.
+        """
+        value: object = self._call_dunder("__gt__", other)
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __gt__ did not return bool")
+        return value
+
+    def __ge__(self, other: object) -> bool:
+        """Evaluate remote greater-or-equal.
+
+        :param other: Comparator value.
+        :returns: Comparison result.
+        """
+        value: object = self._call_dunder("__ge__", other)
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __ge__ did not return bool")
+        return value
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        """Invoke remote ``__call__``.
+
+        :param args: Positional arguments.
+        :param kwargs: Keyword arguments.
+        :returns: Remote return value.
+        """
+        return self._runtime.call_parent_attr(self._remote_object_id, "__call__", list(args), kwargs)
+
+    def __enter__(self) -> object:
+        """Enter remote context manager.
+
+        :returns: Context value.
+        """
+        return self._call_dunder("__enter__")
+
+    def __exit__(self, exc_type: object, exc_value: object, exc_traceback: object) -> object:
+        """Exit remote context manager.
+
+        :param exc_type: Exception type.
+        :param exc_value: Exception value.
+        :param exc_traceback: Exception traceback.
+        :returns: Exit handler result.
+        """
+        return self._call_dunder("__exit__", exc_type, exc_value, exc_traceback)
+
+    def __reduce__(self) -> object:
+        """Block local pickling of remote handle proxies.
+
+        :raises UnsupportedInteractionError: Always.
+        """
+        raise UnsupportedInteractionError("Parent-handle proxies cannot be pickled in the worker")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        """Block local pickling of remote handle proxies.
+
+        :param protocol: Pickle protocol version.
+        :raises UnsupportedInteractionError: Always.
+        """
+        raise UnsupportedInteractionError("Parent-handle proxies cannot be pickled in the worker")
+
+
+class WorkerRuntime:
+    """Own worker-side protocol handling and object dispatch."""
+
+    _connection: Connection
+    _registry: ObjectRegistry
+    _protected_module_names: set[str]
+    _next_request_id: int
+    _parent_proxy_cache: "weakref.WeakValueDictionary[int, _ParentRemoteHandle]"
+
+    def __init__(self, connection: Connection) -> None:
+        """Initialize worker runtime state.
+
+        :param connection: Bidirectional IPC connection to the parent process.
+        """
+        self._connection = connection
+        self._registry = ObjectRegistry()
+        self._protected_module_names = set()
+        self._next_request_id = 1
+        self._parent_proxy_cache = weakref.WeakValueDictionary()
+
+    def run(self) -> None:
+        """Run the worker message loop."""
+        try:
+            _send_ok(self._connection, 0, {"ready": True})
+        except Exception as exc:
+            _send_error(
+                self._connection,
+                0,
+                type(exc).__name__,
+                str(exc),
+                traceback.format_exc(),
+            )
+            self._connection.close()
+            return
+
+        should_exit: bool = False
+        while should_exit is False:
+            try:
+                incoming: object = self._connection.recv()
+            except EOFError:
+                break
+
+            if isinstance(incoming, dict) is False:
+                _send_error(
+                    self._connection,
+                    -1,
+                    "ExtraditeProtocolError",
+                    "Incoming message must be a dict",
+                    "",
+                )
+                continue
+
+            request_message: dict[str, object] = incoming
+            shutdown_requested: bool = self._handle_incoming_request(request_message)
+            if shutdown_requested is True:
+                should_exit = True
+
+        self._registry.clear()
+        self._parent_proxy_cache.clear()
+        self._connection.close()
+
+    def _handle_incoming_request(self, request_message: dict[str, object]) -> bool:
+        """Handle one incoming request and emit a correlated response.
+
+        :param request_message: Request dictionary.
+        :returns: ``True`` when loop shutdown is requested.
+        """
+        request_id: int
+        try:
+            request_id = _require_request_id(request_message)
+            payload: dict[str, object] = self._execute_request(request_message)
+            _send_ok(self._connection, request_id, payload)
+            shutdown_obj: object = payload.get("shutdown")
+            shutdown_requested: bool = shutdown_obj is True
+            return shutdown_requested
+        except _RemotePeerError as exc:
+            request_id_fallback: int = -1
+            request_id_obj: object = request_message.get("request_id")
+            if isinstance(request_id_obj, int) is True:
+                request_id_fallback = request_id_obj
+            _send_error(
+                self._connection,
+                request_id_fallback,
+                exc.remote_type_name,
+                exc.remote_message,
+                exc.remote_traceback,
+            )
+            return False
+        except Exception as exc:
+            request_id_fallback = -1
+            request_id_obj = request_message.get("request_id")
+            if isinstance(request_id_obj, int) is True:
+                request_id_fallback = request_id_obj
+            _send_error(
+                self._connection,
+                request_id_fallback,
+                type(exc).__name__,
+                str(exc),
+                traceback.format_exc(),
+            )
+            return False
+
+    def _decode_from_parent(self, value: object) -> object:
+        """Decode one wire value received from the parent.
+
+        :param value: Wire value.
+        :returns: Runtime value.
+        :raises ExtraditeProtocolError: If the payload shape is invalid.
+        """
+        if isinstance(value, tuple) is True:
+            tuple_length: int = len(value)
+            if tuple_length == 2:
+                tag_obj: object = value[0]
+                payload_obj: object = value[1]
+                if tag_obj == WIRE_PICKLE_TAG:
+                    if isinstance(payload_obj, bytes) is False:
+                        raise ExtraditeProtocolError("Pickle payload must be bytes")
+                    try:
+                        return pickle.loads(payload_obj)
+                    except (pickle.UnpicklingError, EOFError, AttributeError, ValueError) as exc:
+                        raise ExtraditeProtocolError("Failed to unpickle parent payload") from exc
+            if tuple_length == 3:
+                tag_obj = value[0]
+                owner_obj: object = value[1]
+                object_id_obj: object = value[2]
+                if tag_obj == WIRE_REF_TAG:
+                    if isinstance(owner_obj, str) is False:
+                        raise ExtraditeProtocolError("Reference owner must be a string")
+                    if isinstance(object_id_obj, int) is False:
+                        raise ExtraditeProtocolError("Reference object id must be an int")
+                    owner: str = owner_obj
+                    object_id: int = object_id_obj
+                    if owner == OWNER_CHILD:
+                        return self._registry.get(object_id)
+                    if owner == OWNER_PARENT:
+                        return self._get_or_create_parent_proxy(object_id)
+                    raise ExtraditeProtocolError(f"Unknown reference owner: {owner!r}")
+            return tuple(self._decode_from_parent(item) for item in value)
+
+        if isinstance(value, list) is True:
+            return [self._decode_from_parent(item) for item in value]
+
+        if isinstance(value, set) is True:
+            decoded_items: set[object] = set()
+            for item in value:
+                decoded_item: object = self._decode_from_parent(item)
+                decoded_items.add(decoded_item)
+            return decoded_items
+
+        if isinstance(value, frozenset) is True:
+            decoded_items_frozen: set[object] = set()
+            for item in value:
+                decoded_item = self._decode_from_parent(item)
+                decoded_items_frozen.add(decoded_item)
+            return frozenset(decoded_items_frozen)
+
+        if isinstance(value, dict) is True:
+            decoded_dict: dict[object, object] = {}
+            for key, item in value.items():
+                decoded_key: object = self._decode_from_parent(key)
+                try:
+                    hash(decoded_key)
+                except TypeError as exc:
+                    raise UnsupportedInteractionError("Decoded dict keys must stay hashable") from exc
+                decoded_item: object = self._decode_from_parent(item)
+                decoded_dict[decoded_key] = decoded_item
+            return decoded_dict
+
+        return value
+
+    def _encode_for_parent(self, value: object) -> object:
+        """Encode one runtime value for transport to the parent.
+
+        :param value: Runtime value.
+        :returns: Wire value.
+        :raises UnsupportedInteractionError: If value transfer is disallowed.
+        """
+        if isinstance(value, _ParentRemoteHandle) is True:
+            return (WIRE_REF_TAG, OWNER_PARENT, value.remote_object_id)
+
+        if isinstance(value, list) is True:
+            return [self._encode_for_parent(item) for item in value]
+
+        if isinstance(value, tuple) is True:
+            return tuple(self._encode_for_parent(item) for item in value)
+
+        if isinstance(value, set) is True:
+            encoded_items: set[object] = set()
+            for item in value:
+                encoded_item: object = self._encode_for_parent(item)
+                encoded_items.add(encoded_item)
+            return encoded_items
+
+        if isinstance(value, frozenset) is True:
+            encoded_frozen_items: set[object] = set()
+            for item in value:
+                encoded_item = self._encode_for_parent(item)
+                encoded_frozen_items.add(encoded_item)
+            return frozenset(encoded_frozen_items)
+
+        if isinstance(value, dict) is True:
+            encoded_dict: dict[object, object] = {}
+            for key, item in value.items():
+                encoded_key: object = self._encode_for_parent(key)
+                try:
+                    hash(encoded_key)
+                except TypeError as exc:
+                    raise UnsupportedInteractionError("Encoded dict keys must stay hashable") from exc
+                encoded_item: object = self._encode_for_parent(item)
+                encoded_dict[encoded_key] = encoded_item
+            return encoded_dict
+
+        seen_ids: set[int] = set()
+        contains_protected: bool = _value_originates_from_module(value, self._protected_module_names, seen_ids)
+        if contains_protected is True:
+            raise UnsupportedInteractionError(
+                "Refusing to transfer values that originate from the protected isolated module"
+            )
+
+        try:
+            payload: bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            return (WIRE_PICKLE_TAG, payload)
+        except (pickle.PicklingError, TypeError, AttributeError, ValueError):
+            object_id: int = self._registry.store(value)
+            return (WIRE_REF_TAG, OWNER_CHILD, object_id)
+
+    def _decode_args_from_parent(self, message: dict[str, object]) -> tuple[list[object], dict[str, object]]:
+        """Decode args/kwargs from a request message.
+
+        :param message: Request message.
+        :returns: Positional and keyword argument values.
+        :raises ExtraditeProtocolError: If argument payload types are invalid.
+        """
+        raw_args: object = message.get("args", [])
+        if isinstance(raw_args, list) is False:
+            raise ExtraditeProtocolError("args must be a list")
+
+        raw_kwargs: object = message.get("kwargs", {})
+        if isinstance(raw_kwargs, dict) is False:
+            raise ExtraditeProtocolError("kwargs must be a dict")
+
+        args: list[object] = [self._decode_from_parent(item) for item in raw_args]
+        kwargs: dict[str, object] = {}
+        for key, item in raw_kwargs.items():
+            if isinstance(key, str) is False:
+                raise ExtraditeProtocolError("kwargs keys must be strings")
+            kwargs[key] = self._decode_from_parent(item)
+        return args, kwargs
+
+    def _execute_request(self, message: dict[str, object]) -> dict[str, object]:
+        """Execute one request from the parent.
+
+        :param message: Request message.
+        :returns: Response payload.
+        :raises ExtraditeProtocolError: If request fields are invalid.
+        """
+        action: str = _require_action(message)
+
+        if action == "load_class":
+            module_name: str = _require_str_field(message, "module_name")
+            class_qualname: str = _require_str_field(message, "class_qualname")
+            imported_module = importlib.import_module(module_name)
+            class_object: object = _resolve_qualname(imported_module, class_qualname)
+            is_type: bool = isinstance(class_object, type)
+            if is_type is False:
+                raise ExtraditeProtocolError(f"Target {module_name}:{class_qualname} is not a class")
+            class_object_id: int = self._registry.store(class_object, pinned=True)
+            self._protected_module_names.add(module_name)
+            return {"class_object_id": class_object_id}
+
+        if action == "construct":
+            class_object_id: int = _require_int_field(message, "class_object_id")
+            args, kwargs = self._decode_args_from_parent(message)
+            class_object: object = self._registry.get(class_object_id)
+            instance: object = class_object(*args, **kwargs)  # type: ignore[operator]
+            object_id: int = self._registry.store(instance)
+            return {"object_id": object_id}
+
+        if action == "get_attr":
+            object_id: int = _require_int_field(message, "object_id")
+            attr_name: str = _require_str_field(message, "attr_name")
+            target: object = self._registry.get(object_id)
+            attr_value: object = getattr(target, attr_name)
+            is_callable: bool = callable(attr_value)
+            if is_callable is True:
+                return {"callable": True}
+            return {"callable": False, "value": self._encode_for_parent(attr_value)}
+
+        if action == "set_attr":
+            object_id = _require_int_field(message, "object_id")
+            attr_name = _require_str_field(message, "attr_name")
+            raw_value: object = message.get("value")
+            value: object = self._decode_from_parent(raw_value)
+            target = self._registry.get(object_id)
+            setattr(target, attr_name, value)
+            return {}
+
+        if action == "del_attr":
+            object_id = _require_int_field(message, "object_id")
+            attr_name = _require_str_field(message, "attr_name")
+            target = self._registry.get(object_id)
+            delattr(target, attr_name)
+            return {}
+
+        if action == "call_attr":
+            object_id = _require_int_field(message, "object_id")
+            attr_name = _require_str_field(message, "attr_name")
+            args, kwargs = self._decode_args_from_parent(message)
+            target = self._registry.get(object_id)
+            callable_obj: object = getattr(target, attr_name)
+            is_callable = callable(callable_obj)
+            if is_callable is False:
+                raise ExtraditeProtocolError(f"Attribute {attr_name!r} is not callable")
+            result: object = callable_obj(*args, **kwargs)  # type: ignore[operator]
+            return {"value": self._encode_for_parent(result)}
+
+        if action == "release_object":
+            object_id = _require_int_field(message, "object_id")
+            self._registry.release(object_id)
+            return {}
+
+        if action == "shutdown":
+            return {"shutdown": True}
+
+        raise ExtraditeProtocolError(f"Unsupported action: {action}")
+
+    def _get_or_create_parent_proxy(self, object_id: int) -> _ParentRemoteHandle:
+        """Return cached parent proxy or create a new one.
+
+        :param object_id: Parent-owned object identifier.
+        :returns: Parent object proxy.
+        """
+        cached: _ParentRemoteHandle | None = self._parent_proxy_cache.get(object_id)
+        if cached is not None:
+            return cached
+
+        created: _ParentRemoteHandle = _ParentRemoteHandle(self, object_id)
+        self._parent_proxy_cache[object_id] = created
+        return created
+
+    def _send_request_to_parent(self, action: str, payload: dict[str, object]) -> dict[str, object]:
+        """Send one request to the parent and await the correlated response.
+
+        :param action: Action name.
+        :param payload: Action payload.
+        :returns: Response payload dictionary.
+        :raises ExtraditeProtocolError: If transport fails or response shape is invalid.
+        :raises _RemotePeerError: If parent reports an exception.
+        """
+        request_id: int = self._next_request_id
+        self._next_request_id += 1
+        request: dict[str, object] = {
+            "request_id": request_id,
+            "action": action,
+        }
+        request.update(payload)
+
+        try:
+            self._connection.send(request)
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            raise ExtraditeProtocolError("Failed to send request to parent process") from exc
+
+        return self._wait_for_response(request_id)
+
+    def _wait_for_response(self, expected_request_id: int) -> dict[str, object]:
+        """Wait for one correlated response while servicing re-entrant requests.
+
+        :param expected_request_id: Response request id to wait for.
+        :returns: Response payload dictionary.
+        :raises ExtraditeProtocolError: If transport fails or message shape is invalid.
+        :raises _RemotePeerError: If parent reports an exception.
+        """
+        while True:
+            incoming: object
+            try:
+                incoming = self._connection.recv()
+            except (EOFError, BrokenPipeError, OSError) as exc:
+                raise ExtraditeProtocolError("Failed to receive message from parent process") from exc
+
+            if isinstance(incoming, dict) is False:
+                raise ExtraditeProtocolError("Incoming parent message must be a dict")
+
+            message: dict[str, object] = incoming
+            has_status: bool = "status" in message
+            has_action: bool = "action" in message
+
+            if has_status is True:
+                response_request_id: int = _require_request_id(message)
+                if response_request_id != expected_request_id:
+                    raise ExtraditeProtocolError(
+                        "Unexpected response request_id "
+                        + f"{response_request_id}; expected {expected_request_id}"
+                    )
+
+                status_obj: object = message.get("status")
+                if isinstance(status_obj, str) is False:
+                    raise ExtraditeProtocolError("Response status must be a string")
+                status: str = status_obj
+
+                payload_obj: object = message.get("payload")
+                if isinstance(payload_obj, dict) is False:
+                    raise ExtraditeProtocolError("Response payload must be a dict")
+                payload: dict[str, object] = payload_obj
+
+                if status == "ok":
+                    return payload
+                if status != "error":
+                    raise ExtraditeProtocolError(f"Unknown response status: {status!r}")
+
+                error_type_obj: object = payload.get("error_type", "Exception")
+                error_message_obj: object = payload.get("error_message", "")
+                traceback_obj: object = payload.get("stacktrace", "")
+
+                error_type: str = "Exception"
+                if isinstance(error_type_obj, str) is True:
+                    error_type = error_type_obj
+                error_message: str = ""
+                if isinstance(error_message_obj, str) is True:
+                    error_message = error_message_obj
+                remote_traceback: str = ""
+                if isinstance(traceback_obj, str) is True:
+                    remote_traceback = traceback_obj
+
+                raise _RemotePeerError(error_type, error_message, remote_traceback)
+
+            if has_action is True:
+                self._handle_incoming_request(message)
+                continue
+
+            raise ExtraditeProtocolError("Incoming message must include either status or action")
+
+    def get_parent_attr(self, object_id: int, attr_name: str) -> object:
+        """Get one parent-side attribute from a referenced object.
+
+        :param object_id: Parent-owned object identifier.
+        :param attr_name: Attribute name.
+        :returns: Attribute value or call proxy.
+        """
+        response_payload: dict[str, object] = self._send_request_to_parent(
+            "get_attr",
+            {
+                "object_id": object_id,
+                "attr_name": attr_name,
+            },
+        )
+        callable_obj: object = response_payload.get("callable")
+        if isinstance(callable_obj, bool) is False:
+            raise ExtraditeProtocolError("get_attr payload missing bool callable")
+
+        if callable_obj is True:
+            return _ParentCallProxy(self, object_id, attr_name)
+
+        encoded_value: object = response_payload.get("value")
+        return self._decode_from_parent(encoded_value)
+
+    def call_parent_attr(
+        self,
+        object_id: int,
+        attr_name: str,
+        args: list[object],
+        kwargs: dict[str, object],
+    ) -> object:
+        """Call one parent-side attribute.
+
+        :param object_id: Parent-owned object identifier.
+        :param attr_name: Callable attribute name.
+        :param args: Positional arguments.
+        :param kwargs: Keyword arguments.
+        :returns: Decoded return value.
+        """
+        encoded_args: list[object] = [self._encode_for_parent(item) for item in args]
+        encoded_kwargs: dict[str, object] = {}
+        for key, value in kwargs.items():
+            encoded_kwargs[key] = self._encode_for_parent(value)
+
+        response_payload = self._send_request_to_parent(
+            "call_attr",
+            {
+                "object_id": object_id,
+                "attr_name": attr_name,
+                "args": encoded_args,
+                "kwargs": encoded_kwargs,
+            },
+        )
+        encoded_value: object = response_payload.get("value")
+        return self._decode_from_parent(encoded_value)
+
+    def set_parent_attr(self, object_id: int, attr_name: str, value: object) -> None:
+        """Set one parent-side attribute.
+
+        :param object_id: Parent-owned object identifier.
+        :param attr_name: Attribute name.
+        :param value: Attribute value.
+        """
+        encoded_value: object = self._encode_for_parent(value)
+        self._send_request_to_parent(
+            "set_attr",
+            {
+                "object_id": object_id,
+                "attr_name": attr_name,
+                "value": encoded_value,
+            },
+        )
+
+    def del_parent_attr(self, object_id: int, attr_name: str) -> None:
+        """Delete one parent-side attribute.
+
+        :param object_id: Parent-owned object identifier.
+        :param attr_name: Attribute name.
+        """
+        self._send_request_to_parent(
+            "del_attr",
+            {
+                "object_id": object_id,
+                "attr_name": attr_name,
+            },
+        )
+
+    def release_parent_object_safely(self, object_id: int) -> None:
+        """Best-effort parent handle release for finalizers.
+
+        :param object_id: Parent-owned object identifier.
+        """
+        try:
+            self.release_parent_object(object_id)
+        except (ExtraditeProtocolError, _RemotePeerError, OSError):
+            return
+
+    def release_parent_object(self, object_id: int) -> None:
+        """Release one parent-owned object handle.
+
+        :param object_id: Parent-owned object identifier.
+        """
+        self._parent_proxy_cache.pop(object_id, None)
+        self._send_request_to_parent(
+            "release_object",
+            {
+                "object_id": object_id,
+            },
+        )
 
 
 def worker_entry(connection: Connection) -> None:
@@ -495,70 +1212,5 @@ def worker_entry(connection: Connection) -> None:
 
     :param connection: IPC connection from parent process.
     """
-    registry = ObjectRegistry()
-    protected_module_names: set[str] = set()
-
-    try:
-        _send_ok(connection, 0, {"ready": True})
-    except Exception as exc:
-        _send_error(
-            connection,
-            0,
-            type(exc).__name__,
-            str(exc),
-            traceback.format_exc(),
-        )
-        connection.close()
-        return
-
-    should_exit: bool = False
-    while should_exit is False:
-        try:
-            incoming: object = connection.recv()
-        except EOFError:
-            break
-
-        if isinstance(incoming, dict) is False:
-            _send_error(
-                connection,
-                -1,
-                "ExtraditeProtocolError",
-                "Incoming message must be a dict",
-                "",
-            )
-            continue
-
-        request_message: dict[str, object] = incoming
-        request_id: int
-        try:
-            request_id = _require_request_id(request_message)
-        except Exception as exc:
-            _send_error(
-                connection,
-                -1,
-                type(exc).__name__,
-                str(exc),
-                traceback.format_exc(),
-            )
-            continue
-
-        try:
-            payload: dict[str, object] = _handle_request(
-                request_message,
-                registry,
-                protected_module_names,
-            )
-            _send_ok(connection, request_id, payload)
-            shutdown_requested: object = payload.get("shutdown")
-            if shutdown_requested is True:
-                should_exit = True
-        except Exception as exc:
-            _send_error(
-                connection,
-                request_id,
-                type(exc).__name__,
-                str(exc),
-                traceback.format_exc(),
-            )
-
-    connection.close()
+    runtime: WorkerRuntime = WorkerRuntime(connection)
+    runtime.run()

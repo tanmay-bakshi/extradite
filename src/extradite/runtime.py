@@ -6,6 +6,7 @@ import multiprocessing
 import pickle
 import sys
 import threading
+import traceback
 import weakref
 from collections.abc import Callable
 from multiprocessing.connection import Connection
@@ -16,7 +17,10 @@ from extradite.errors import ExtraditeModuleLeakError
 from extradite.errors import ExtraditeProtocolError
 from extradite.errors import ExtraditeRemoteError
 from extradite.errors import UnsupportedInteractionError
-from extradite.worker import REMOTE_REF_KEY
+from extradite.worker import OWNER_CHILD
+from extradite.worker import OWNER_PARENT
+from extradite.worker import WIRE_PICKLE_TAG
+from extradite.worker import WIRE_REF_TAG
 from extradite.worker import worker_entry
 
 _SHARED_SESSION_LOCK: threading.RLock = threading.RLock()
@@ -60,7 +64,7 @@ def _parse_target(target: str) -> tuple[str, str]:
     """
     parts: list[str] = target.split(":")
     if len(parts) != 2:
-        raise ValueError("Target must use 'module.path:ClassName' format")
+        raise ValueError("Target must use module.path:ClassName format")
 
     module_name: str = parts[0].strip()
     class_qualname: str = parts[1].strip()
@@ -89,7 +93,7 @@ def _find_module_leaks(module_name: str) -> list[str]:
 
 
 class _RootSafeUnpickler(pickle.Unpickler):
-    """Unpickler that blocks imports from the protected module tree."""
+    """Unpickler that blocks imports from protected module trees."""
 
     _protected_module_names: set[str]
 
@@ -136,6 +140,67 @@ def _safe_unpickle(payload: bytes, protected_module_names: set[str]) -> object:
         raise
     except (pickle.UnpicklingError, EOFError, AttributeError, ValueError) as exc:
         raise ExtraditeProtocolError("Failed to unpickle child payload") from exc
+
+
+class _LocalObjectRegistry:
+    """Store parent-side objects exposed to the child via handles."""
+
+    _by_object_id: dict[int, object]
+    _by_identity: dict[int, int]
+    _next_object_id: int
+
+    def __init__(self) -> None:
+        """Initialize an empty object registry."""
+        self._by_object_id = {}
+        self._by_identity = {}
+        self._next_object_id = 1
+
+    def store(self, value: object) -> int:
+        """Store a value and return its object identifier.
+
+        :param value: Object to store.
+        :returns: Integer identifier for the object.
+        """
+        identity: int = id(value)
+        existing: int | None = self._by_identity.get(identity)
+        if existing is not None:
+            return existing
+
+        object_id: int = self._next_object_id
+        self._next_object_id += 1
+        self._by_object_id[object_id] = value
+        self._by_identity[identity] = object_id
+        return object_id
+
+    def get(self, object_id: int) -> object:
+        """Return one stored object.
+
+        :param object_id: Stored object identifier.
+        :returns: Stored object.
+        :raises ExtraditeProtocolError: If the identifier is unknown or released.
+        """
+        exists: bool = object_id in self._by_object_id
+        if exists is False:
+            raise ExtraditeProtocolError(f"Unknown or released remote object id: {object_id}")
+        return self._by_object_id[object_id]
+
+    def release(self, object_id: int) -> None:
+        """Release one stored object.
+
+        :param object_id: Stored object identifier.
+        """
+        exists: bool = object_id in self._by_object_id
+        if exists is False:
+            return
+
+        value: object = self._by_object_id.pop(object_id)
+        identity: int = id(value)
+        self._by_identity.pop(identity, None)
+
+    def clear(self) -> None:
+        """Clear all entries."""
+        self._by_object_id.clear()
+        self._by_identity.clear()
 
 
 def _finalize_remote_object(session_ref: "weakref.ReferenceType[ExtraditeSession]", object_id: int) -> None:
@@ -203,80 +268,12 @@ class _ClassCloseProxy:
         self._session.release_target(self._remote_target)
 
 
-class ExtraditedMeta(type):
-    """Metaclass for dynamically generated extradited proxy classes."""
+class _RemoteProxyOps:
+    """Shared protocol-level operations for remote object proxies."""
 
-    _session: ClassVar["ExtraditeSession"]
-    _class_object_id: ClassVar[int]
-    _remote_target: ClassVar[str]
-
-    def __call__(cls, *args: object, **kwargs: object) -> object:
-        """Construct a remote instance and return its local proxy.
-
-        :param args: Positional constructor arguments.
-        :param kwargs: Keyword constructor arguments.
-        :returns: Local proxy to the remote instance.
-        """
-        session: ExtraditeSession = cls._session
-        class_object_id: int = cls._class_object_id
-        object_id: int = session.construct_instance(class_object_id, list(args), kwargs)
-        return session.get_or_create_proxy(object_id, cls)
-
-    def __getattribute__(cls, attr_name: str) -> object:
-        """Resolve special metaclass attributes.
-
-        :param attr_name: Attribute name requested on the class object.
-        :returns: Resolved attribute value.
-        """
-        if attr_name == "close":
-            session: ExtraditeSession = type.__getattribute__(cls, "_session")
-            remote_target: str = type.__getattribute__(cls, "_remote_target")
-            return _ClassCloseProxy(session, remote_target)
-        return super().__getattribute__(attr_name)
-
-    def __getattr__(cls, attr_name: str) -> object:
-        """Resolve class attributes via the remote class object.
-
-        :param attr_name: Class attribute name.
-        :returns: Class attribute value or callable wrapper.
-        """
-        session: ExtraditeSession = cls._session
-        class_object_id: int = cls._class_object_id
-        return session.get_attr(class_object_id, attr_name)
-
-
-class ExtraditedObjectBase(metaclass=ExtraditedMeta):
-    """Base instance proxy that forwards operations to the child process."""
-
-    _session: ClassVar["ExtraditeSession"]
-    _class_object_id: ClassVar[int]
-    _remote_target: ClassVar[str]
+    _session: "ExtraditeSession"
     _remote_object_id: int
     _finalizer: weakref.finalize
-
-    def __init__(self) -> None:
-        """Prevent direct initialization from root process code.
-
-        :raises UnsupportedInteractionError: Always.
-        """
-        raise UnsupportedInteractionError(
-            "Proxy instances are created by the extradited class constructor only"
-        )
-
-    @classmethod
-    def _bind_remote(cls, instance: "ExtraditedObjectBase", object_id: int) -> "ExtraditedObjectBase":
-        """Bind a just-allocated instance to a remote object identifier.
-
-        :param instance: Newly allocated instance.
-        :param object_id: Remote object identifier.
-        :returns: Bound instance.
-        """
-        session: ExtraditeSession = cls._session
-        session_ref: "weakref.ReferenceType[ExtraditeSession]" = weakref.ref(session)
-        object.__setattr__(instance, "_remote_object_id", object_id)
-        finalizer: weakref.finalize = weakref.finalize(instance, _finalize_remote_object, session_ref, object_id)
-        object.__setattr__(instance, "_finalizer", finalizer)
-        return instance
 
     @property
     def remote_object_id(self) -> int:
@@ -293,7 +290,7 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
             self._finalizer()
 
     def __getattr__(self, attr_name: str) -> object:
-        """Resolve instance attributes via the child process.
+        """Resolve remote attributes.
 
         :param attr_name: Instance attribute name.
         :returns: Attribute value or callable wrapper.
@@ -301,7 +298,7 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
         return self._session.get_attr(self._remote_object_id, attr_name)
 
     def __setattr__(self, attr_name: str, value: object) -> None:
-        """Set instance attributes remotely.
+        """Set remote attributes.
 
         :param attr_name: Attribute name.
         :param value: Attribute value.
@@ -313,7 +310,7 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
         self._session.set_attr(self._remote_object_id, attr_name, value)
 
     def __delattr__(self, attr_name: str) -> None:
-        """Delete instance attributes remotely.
+        """Delete remote attributes.
 
         :param attr_name: Attribute name.
         """
@@ -324,7 +321,7 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
         self._session.del_attr(self._remote_object_id, attr_name)
 
     def _call_dunder(self, attr_name: str, *args: object) -> object:
-        """Call a dunder method remotely.
+        """Call one dunder method remotely.
 
         :param attr_name: Dunder method name.
         :param args: Positional arguments.
@@ -340,7 +337,7 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
     def __repr__(self) -> str:
         """Return the remote ``repr`` string.
 
-        :returns: Repr string.
+        :returns: Representation string.
         """
         value: object = self._call_dunder("__repr__")
         if isinstance(value, str) is False:
@@ -387,7 +384,7 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
             raise ExtraditeProtocolError("Remote __len__ did not return int")
         return value
 
-    def __iter__(self) -> Any:
+    def __iter__(self) -> object:
         """Return remote iterator.
 
         :returns: Iterator-like value.
@@ -548,6 +545,100 @@ class ExtraditedObjectBase(metaclass=ExtraditedMeta):
         raise UnsupportedInteractionError("Proxy instances cannot be pickled in the root process")
 
 
+class ExtraditedMeta(type):
+    """Metaclass for dynamically generated extradited proxy classes."""
+
+    _session: ClassVar["ExtraditeSession"]
+    _class_object_id: ClassVar[int]
+    _remote_target: ClassVar[str]
+
+    def __call__(cls, *args: object, **kwargs: object) -> object:
+        """Construct a remote instance and return its local proxy.
+
+        :param args: Positional constructor arguments.
+        :param kwargs: Keyword constructor arguments.
+        :returns: Local proxy to the remote instance.
+        """
+        session: ExtraditeSession = cls._session
+        class_object_id: int = cls._class_object_id
+        object_id: int = session.construct_instance(class_object_id, list(args), kwargs)
+        return session.get_or_create_instance_proxy(object_id, cls)
+
+    def __getattribute__(cls, attr_name: str) -> object:
+        """Resolve special metaclass attributes.
+
+        :param attr_name: Attribute name requested on the class object.
+        :returns: Resolved attribute value.
+        """
+        if attr_name == "close":
+            session: ExtraditeSession = type.__getattribute__(cls, "_session")
+            remote_target: str = type.__getattribute__(cls, "_remote_target")
+            return _ClassCloseProxy(session, remote_target)
+        return super().__getattribute__(attr_name)
+
+    def __getattr__(cls, attr_name: str) -> object:
+        """Resolve class attributes via the remote class object.
+
+        :param attr_name: Class attribute name.
+        :returns: Class attribute value or callable wrapper.
+        """
+        session: ExtraditeSession = cls._session
+        class_object_id: int = cls._class_object_id
+        return session.get_attr(class_object_id, attr_name)
+
+
+class ExtraditedObjectBase(_RemoteProxyOps, metaclass=ExtraditedMeta):
+    """Base instance proxy that forwards operations to the child process."""
+
+    _session: ClassVar["ExtraditeSession"]
+    _class_object_id: ClassVar[int]
+    _remote_target: ClassVar[str]
+
+    def __init__(self) -> None:
+        """Prevent direct initialization from root process code.
+
+        :raises UnsupportedInteractionError: Always.
+        """
+        raise UnsupportedInteractionError(
+            "Proxy instances are created by the extradited class constructor only"
+        )
+
+    @classmethod
+    def _bind_remote(cls, instance: "ExtraditedObjectBase", object_id: int) -> "ExtraditedObjectBase":
+        """Bind a just-allocated instance to a remote object identifier.
+
+        :param instance: Newly allocated instance.
+        :param object_id: Remote object identifier.
+        :returns: Bound instance.
+        """
+        session: ExtraditeSession = cls._session
+        session_ref: "weakref.ReferenceType[ExtraditeSession]" = weakref.ref(session)
+        object.__setattr__(instance, "_remote_object_id", object_id)
+        finalizer: weakref.finalize = weakref.finalize(instance, _finalize_remote_object, session_ref, object_id)
+        object.__setattr__(instance, "_finalizer", finalizer)
+        return instance
+
+
+class _RemoteHandleProxy(_RemoteProxyOps):
+    """Generic proxy for remote handle values returned from the child."""
+
+    _session: "ExtraditeSession"
+    _remote_object_id: int
+    _finalizer: weakref.finalize
+
+    def __init__(self, session: "ExtraditeSession", object_id: int) -> None:
+        """Initialize one generic remote handle proxy.
+
+        :param session: Owning session.
+        :param object_id: Remote object identifier.
+        """
+        object.__setattr__(self, "_session", session)
+        object.__setattr__(self, "_remote_object_id", object_id)
+        session_ref: "weakref.ReferenceType[ExtraditeSession]" = weakref.ref(session)
+        finalizer: weakref.finalize = weakref.finalize(self, _finalize_remote_object, session_ref, object_id)
+        object.__setattr__(self, "_finalizer", finalizer)
+
+
 class ExtraditeSession:
     """Manage one child interpreter and its IPC channel."""
 
@@ -558,7 +649,9 @@ class ExtraditeSession:
     _next_request_id: int
     _is_closed: bool
     _lock: threading.RLock
-    _proxy_cache: "weakref.WeakValueDictionary[int, ExtraditedObjectBase]"
+    _instance_proxy_cache: "weakref.WeakValueDictionary[int, ExtraditedObjectBase]"
+    _handle_proxy_cache: "weakref.WeakValueDictionary[int, _RemoteHandleProxy]"
+    _local_object_registry: _LocalObjectRegistry
     _protected_module_names: set[str]
     _class_object_ids_by_target: dict[str, int]
     _target_reference_counts: dict[str, int]
@@ -576,7 +669,9 @@ class ExtraditeSession:
         self._next_request_id = 1
         self._is_closed = False
         self._lock = threading.RLock()
-        self._proxy_cache = weakref.WeakValueDictionary()
+        self._instance_proxy_cache = weakref.WeakValueDictionary()
+        self._handle_proxy_cache = weakref.WeakValueDictionary()
+        self._local_object_registry = _LocalObjectRegistry()
         self._protected_module_names = set()
         self._class_object_ids_by_target = {}
         self._target_reference_counts = {}
@@ -610,7 +705,7 @@ class ExtraditeSession:
             self._connection = parent_connection
             self._process = process
 
-            response: dict[str, object] = self._receive_response(expected_request_id=0)
+            response: dict[str, object] = self._wait_for_response(expected_request_id=0)
             payload: object = response.get("payload")
             if isinstance(payload, dict) is False:
                 self.close()
@@ -644,13 +739,18 @@ class ExtraditeSession:
             self._assert_module_not_loaded(module_name)
             self._protected_module_names.add(module_name)
 
-            response: dict[str, object] = self._send_request(
-                "load_class",
-                {
-                    "module_name": module_name,
-                    "class_qualname": class_qualname,
-                },
-            )
+            try:
+                response: dict[str, object] = self._send_request(
+                    "load_class",
+                    {
+                        "module_name": module_name,
+                        "class_qualname": class_qualname,
+                    },
+                )
+            except Exception:
+                traceback.format_exc()
+                self._protected_module_names.discard(module_name)
+                raise
 
             payload: object = response.get("payload")
             if isinstance(payload, dict) is False:
@@ -727,20 +827,23 @@ class ExtraditeSession:
         :raises ExtraditeProtocolError: For protocol errors from child.
         :raises UnsupportedInteractionError: For disallowed barrier interactions.
         """
-        error_type: object = payload.get("error_type", "Exception")
-        error_message: object = payload.get("error_message", "")
-        stacktrace: object = payload.get("stacktrace", "")
+        error_type_obj: object = payload.get("error_type", "Exception")
+        error_message_obj: object = payload.get("error_message", "")
+        stacktrace_obj: object = payload.get("stacktrace", "")
 
-        if isinstance(error_type, str) is False:
-            error_type = "Exception"
-        if isinstance(error_message, str) is False:
-            error_message = ""
-        if isinstance(stacktrace, str) is False:
-            stacktrace = ""
+        error_type: str = "Exception"
+        if isinstance(error_type_obj, str) is True:
+            error_type = error_type_obj
+        error_message: str = ""
+        if isinstance(error_message_obj, str) is True:
+            error_message = error_message_obj
+        stacktrace: str = ""
+        if isinstance(stacktrace_obj, str) is True:
+            stacktrace = stacktrace_obj
 
         formatted: str = (
             f"Child process raised {error_type}: {error_message}\n"
-            f"Remote traceback:\n{stacktrace}"
+            + f"Remote traceback:\n{stacktrace}"
         )
 
         if error_type == "UnsupportedInteractionError":
@@ -749,57 +852,79 @@ class ExtraditeSession:
             raise ExtraditeProtocolError(formatted)
         if error_type == "ExtraditeModuleLeakError":
             raise ExtraditeModuleLeakError(formatted)
-        raise ExtraditeRemoteError(formatted)
+        raise ExtraditeRemoteError(error_type, error_message, stacktrace)
 
-    def _receive_response(self, expected_request_id: int) -> dict[str, object]:
-        """Receive and validate one response message.
+    def _decode_from_child(self, value: object) -> object:
+        """Decode one wire value received from the child.
 
-        :param expected_request_id: Expected request identifier.
-        :returns: Validated response message.
-        :raises ExtraditeRemoteError: If child process reports an exception.
-        :raises ExtraditeProtocolError: If message format is invalid.
+        :param value: Wire value.
+        :returns: Runtime value.
+        :raises ExtraditeProtocolError: If the payload shape is invalid.
         """
-        connection: Connection = self._require_connection()
-        incoming: object
-        try:
-            incoming = connection.recv()
-        except (EOFError, BrokenPipeError, OSError) as exc:
-            raise ExtraditeProtocolError("Failed to receive response from child process") from exc
+        if isinstance(value, tuple) is True:
+            tuple_length: int = len(value)
+            if tuple_length == 2:
+                tag_obj: object = value[0]
+                payload_obj: object = value[1]
+                if tag_obj == WIRE_PICKLE_TAG:
+                    if isinstance(payload_obj, bytes) is False:
+                        raise ExtraditeProtocolError("Encoded pickle payload must be bytes")
+                    return _safe_unpickle(payload_obj, self._protected_module_names)
+            if tuple_length == 3:
+                tag_obj = value[0]
+                owner_obj: object = value[1]
+                object_id_obj: object = value[2]
+                if tag_obj == WIRE_REF_TAG:
+                    if isinstance(owner_obj, str) is False:
+                        raise ExtraditeProtocolError("Reference owner must be a string")
+                    if isinstance(object_id_obj, int) is False:
+                        raise ExtraditeProtocolError("Reference object id must be an int")
+                    owner: str = owner_obj
+                    object_id: int = object_id_obj
+                    if owner == OWNER_CHILD:
+                        return self.get_or_create_handle_proxy(object_id)
+                    if owner == OWNER_PARENT:
+                        return self._local_object_registry.get(object_id)
+                    raise ExtraditeProtocolError(f"Unknown reference owner: {owner!r}")
+            return tuple(self._decode_from_child(item) for item in value)
 
-        if isinstance(incoming, dict) is False:
-            raise ExtraditeProtocolError("Child response must be a dict")
-        response: dict[str, object] = incoming
+        if isinstance(value, list) is True:
+            return [self._decode_from_child(item) for item in value]
 
-        request_id: object = response.get("request_id")
-        if isinstance(request_id, int) is False:
-            raise ExtraditeProtocolError("Child response request_id must be an int")
-        if request_id != expected_request_id:
-            raise ExtraditeProtocolError(
-                f"Unexpected response request_id {request_id}; expected {expected_request_id}"
-            )
+        if isinstance(value, set) is True:
+            decoded_items: set[object] = set()
+            for item in value:
+                decoded_item: object = self._decode_from_child(item)
+                decoded_items.add(decoded_item)
+            return decoded_items
 
-        status: object = response.get("status")
-        if isinstance(status, str) is False:
-            raise ExtraditeProtocolError("Child response status must be a string")
+        if isinstance(value, frozenset) is True:
+            decoded_frozen_items: set[object] = set()
+            for item in value:
+                decoded_item = self._decode_from_child(item)
+                decoded_frozen_items.add(decoded_item)
+            return frozenset(decoded_frozen_items)
 
-        if status == "ok":
-            return response
+        if isinstance(value, dict) is True:
+            decoded_dict: dict[object, object] = {}
+            for key, item in value.items():
+                decoded_key: object = self._decode_from_child(key)
+                try:
+                    hash(decoded_key)
+                except TypeError as exc:
+                    raise UnsupportedInteractionError("Decoded dict keys must stay hashable") from exc
+                decoded_item: object = self._decode_from_child(item)
+                decoded_dict[decoded_key] = decoded_item
+            return decoded_dict
 
-        if status != "error":
-            raise ExtraditeProtocolError(f"Unknown child response status: {status!r}")
+        return value
 
-        payload: object = response.get("payload")
-        if isinstance(payload, dict) is False:
-            raise ExtraditeProtocolError("Error response payload must be a dict")
-        self._raise_child_error(payload)
-        raise ExtraditeProtocolError("Unreachable error state")
+    def _encode_for_child(self, value: object) -> object:
+        """Encode one runtime value for transport to the child.
 
-    def _encode_argument(self, value: object) -> object:
-        """Encode one outbound argument for child transport.
-
-        :param value: Root-process value.
-        :returns: Encoded value.
-        :raises UnsupportedInteractionError: If value cannot be encoded safely.
+        :param value: Runtime value.
+        :returns: Wire value.
+        :raises UnsupportedInteractionError: If transfer cannot be performed safely.
         """
         if isinstance(value, ExtraditedObjectBase) is True:
             same_session: bool = value._session is self
@@ -807,59 +932,249 @@ class ExtraditeSession:
                 raise UnsupportedInteractionError(
                     "Cannot pass proxy values between different extradite sessions"
                 )
-            return {REMOTE_REF_KEY: value.remote_object_id}
+            return (WIRE_REF_TAG, OWNER_CHILD, value.remote_object_id)
+
+        if isinstance(value, _RemoteHandleProxy) is True:
+            same_session = value._session is self
+            if same_session is False:
+                raise UnsupportedInteractionError(
+                    "Cannot pass proxy values between different extradite sessions"
+                )
+            return (WIRE_REF_TAG, OWNER_CHILD, value.remote_object_id)
 
         if isinstance(value, list) is True:
-            return [self._encode_argument(item) for item in value]
+            return [self._encode_for_child(item) for item in value]
 
         if isinstance(value, tuple) is True:
-            return tuple(self._encode_argument(item) for item in value)
+            return tuple(self._encode_for_child(item) for item in value)
 
         if isinstance(value, set) is True:
-            return {self._encode_argument(item) for item in value}
+            encoded_items: set[object] = set()
+            for item in value:
+                encoded_item: object = self._encode_for_child(item)
+                encoded_items.add(encoded_item)
+            return encoded_items
+
+        if isinstance(value, frozenset) is True:
+            encoded_frozen_items: set[object] = set()
+            for item in value:
+                encoded_item = self._encode_for_child(item)
+                encoded_frozen_items.add(encoded_item)
+            return frozenset(encoded_frozen_items)
 
         if isinstance(value, dict) is True:
-            encoded: dict[object, object] = {}
+            encoded_dict: dict[object, object] = {}
             for key, item in value.items():
-                encoded_key: object = self._encode_argument(key)
-                is_hashable: bool = hasattr(encoded_key, "__hash__")
-                if is_hashable is False:
-                    raise UnsupportedInteractionError("Encoded dict keys must stay hashable")
-                encoded_item: object = self._encode_argument(item)
-                encoded[encoded_key] = encoded_item
-            return encoded
+                encoded_key: object = self._encode_for_child(key)
+                try:
+                    hash(encoded_key)
+                except TypeError as exc:
+                    raise UnsupportedInteractionError("Encoded dict keys must stay hashable") from exc
+                encoded_item: object = self._encode_for_child(item)
+                encoded_dict[encoded_key] = encoded_item
+            return encoded_dict
 
-        is_picklable: bool = True
         try:
-            pickle.dumps(value)
+            payload: bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            return (WIRE_PICKLE_TAG, payload)
         except (pickle.PicklingError, TypeError, AttributeError, ValueError):
-            is_picklable = False
+            object_id: int = self._local_object_registry.store(value)
+            return (WIRE_REF_TAG, OWNER_PARENT, object_id)
 
-        if is_picklable is False:
-            raise UnsupportedInteractionError(
-                f"Argument {value!r} is not picklable and cannot be transferred"
-            )
-        return value
+    def _decode_args_from_child(self, message: dict[str, object]) -> tuple[list[object], dict[str, object]]:
+        """Decode args/kwargs from child request message.
 
-    def _decode_value(self, encoded: object) -> object:
-        """Decode an inbound value from child payload.
-
-        :param encoded: Encoded result payload.
-        :returns: Decoded value.
-        :raises ExtraditeProtocolError: If payload format is invalid.
+        :param message: Request message.
+        :returns: Positional and keyword argument values.
+        :raises ExtraditeProtocolError: If argument payload types are invalid.
         """
-        if isinstance(encoded, dict) is False:
-            raise ExtraditeProtocolError("Encoded result must be a dict")
+        raw_args: object = message.get("args", [])
+        if isinstance(raw_args, list) is False:
+            raise ExtraditeProtocolError("args must be a list")
 
-        kind: object = encoded.get("kind")
-        if kind != "pickle":
-            raise ExtraditeProtocolError(f"Unknown encoded result kind: {kind!r}")
+        raw_kwargs: object = message.get("kwargs", {})
+        if isinstance(raw_kwargs, dict) is False:
+            raise ExtraditeProtocolError("kwargs must be a dict")
 
-        payload: object = encoded.get("payload")
-        if isinstance(payload, bytes) is False:
-            raise ExtraditeProtocolError("Encoded pickle payload must be bytes")
+        args: list[object] = [self._decode_from_child(item) for item in raw_args]
+        kwargs: dict[str, object] = {}
+        for key, item in raw_kwargs.items():
+            if isinstance(key, str) is False:
+                raise ExtraditeProtocolError("kwargs keys must be strings")
+            kwargs[key] = self._decode_from_child(item)
+        return args, kwargs
 
-        return _safe_unpickle(payload, self._protected_module_names)
+    def _execute_local_request(self, message: dict[str, object]) -> dict[str, object]:
+        """Execute one child-origin request against parent-owned objects.
+
+        :param message: Request message.
+        :returns: Response payload.
+        :raises ExtraditeProtocolError: If request fields are invalid.
+        """
+        action_obj: object = message.get("action")
+        if isinstance(action_obj, str) is False:
+            raise ExtraditeProtocolError("action must be a string")
+        action: str = action_obj
+
+        if action == "get_attr":
+            object_id_obj: object = message.get("object_id")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("object_id must be an integer")
+            attr_name_obj: object = message.get("attr_name")
+            if isinstance(attr_name_obj, str) is False:
+                raise ExtraditeProtocolError("attr_name must be a string")
+
+            target: object = self._local_object_registry.get(object_id_obj)
+            attr_value: object = getattr(target, attr_name_obj)
+            is_callable: bool = callable(attr_value)
+            if is_callable is True:
+                return {"callable": True}
+            return {"callable": False, "value": self._encode_for_child(attr_value)}
+
+        if action == "set_attr":
+            object_id_obj = message.get("object_id")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("object_id must be an integer")
+            attr_name_obj = message.get("attr_name")
+            if isinstance(attr_name_obj, str) is False:
+                raise ExtraditeProtocolError("attr_name must be a string")
+            raw_value: object = message.get("value")
+            value: object = self._decode_from_child(raw_value)
+
+            target = self._local_object_registry.get(object_id_obj)
+            setattr(target, attr_name_obj, value)
+            return {}
+
+        if action == "del_attr":
+            object_id_obj = message.get("object_id")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("object_id must be an integer")
+            attr_name_obj = message.get("attr_name")
+            if isinstance(attr_name_obj, str) is False:
+                raise ExtraditeProtocolError("attr_name must be a string")
+
+            target = self._local_object_registry.get(object_id_obj)
+            delattr(target, attr_name_obj)
+            return {}
+
+        if action == "call_attr":
+            object_id_obj = message.get("object_id")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("object_id must be an integer")
+            attr_name_obj = message.get("attr_name")
+            if isinstance(attr_name_obj, str) is False:
+                raise ExtraditeProtocolError("attr_name must be a string")
+
+            args, kwargs = self._decode_args_from_child(message)
+            target = self._local_object_registry.get(object_id_obj)
+            callable_obj: object = getattr(target, attr_name_obj)
+            callable_flag: bool = callable(callable_obj)
+            if callable_flag is False:
+                raise ExtraditeProtocolError(f"Attribute {attr_name_obj!r} is not callable")
+
+            result: object = callable_obj(*args, **kwargs)  # type: ignore[operator]
+            return {"value": self._encode_for_child(result)}
+
+        if action == "release_object":
+            object_id_obj = message.get("object_id")
+            if isinstance(object_id_obj, int) is False:
+                raise ExtraditeProtocolError("object_id must be an integer")
+            self._local_object_registry.release(object_id_obj)
+            return {}
+
+        raise ExtraditeProtocolError(f"Unsupported action from child: {action}")
+
+    def _handle_incoming_request(self, request_message: dict[str, object]) -> None:
+        """Handle one child-origin request and send its response.
+
+        :param request_message: Child-origin request dictionary.
+        """
+        request_id_obj: object = request_message.get("request_id")
+        request_id: int = -1
+        if isinstance(request_id_obj, int) is True:
+            request_id = request_id_obj
+
+        try:
+            if isinstance(request_id_obj, int) is False:
+                raise ExtraditeProtocolError("request_id must be an integer")
+
+            payload: dict[str, object] = self._execute_local_request(request_message)
+            response: dict[str, object] = {
+                "request_id": request_id,
+                "status": "ok",
+                "payload": payload,
+            }
+            connection: Connection = self._require_connection()
+            connection.send(response)
+        except Exception as exc:
+            error_response: dict[str, object] = {
+                "request_id": request_id,
+                "status": "error",
+                "payload": {
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                    "stacktrace": traceback.format_exc(),
+                },
+            }
+            connection_for_error: Connection = self._require_connection()
+            try:
+                connection_for_error.send(error_response)
+            except (BrokenPipeError, EOFError, OSError):
+                return
+
+    def _wait_for_response(self, expected_request_id: int) -> dict[str, object]:
+        """Wait for one correlated child response while servicing re-entrant requests.
+
+        :param expected_request_id: Request id this side is waiting for.
+        :returns: Response dictionary.
+        :raises ExtraditeRemoteError: If child reports an unknown error type.
+        :raises ExtraditeProtocolError: If response shape is invalid.
+        """
+        while True:
+            connection: Connection = self._require_connection()
+            incoming: object
+            try:
+                incoming = connection.recv()
+            except (EOFError, BrokenPipeError, OSError) as exc:
+                raise ExtraditeProtocolError("Failed to receive message from child process") from exc
+
+            if isinstance(incoming, dict) is False:
+                raise ExtraditeProtocolError("Child message must be a dict")
+
+            message: dict[str, object] = incoming
+            has_status: bool = "status" in message
+            has_action: bool = "action" in message
+
+            if has_status is True:
+                request_id_obj: object = message.get("request_id")
+                if isinstance(request_id_obj, int) is False:
+                    raise ExtraditeProtocolError("Child response request_id must be an int")
+                if request_id_obj != expected_request_id:
+                    raise ExtraditeProtocolError(
+                        f"Unexpected response request_id {request_id_obj}; expected {expected_request_id}"
+                    )
+
+                status_obj: object = message.get("status")
+                if isinstance(status_obj, str) is False:
+                    raise ExtraditeProtocolError("Child response status must be a string")
+                status: str = status_obj
+
+                if status == "ok":
+                    return message
+                if status != "error":
+                    raise ExtraditeProtocolError(f"Unknown child response status: {status!r}")
+
+                payload_obj: object = message.get("payload")
+                if isinstance(payload_obj, dict) is False:
+                    raise ExtraditeProtocolError("Error response payload must be a dict")
+                self._raise_child_error(payload_obj)
+                raise ExtraditeProtocolError("Unreachable child error state")
+
+            if has_action is True:
+                self._handle_incoming_request(message)
+                continue
+
+            raise ExtraditeProtocolError("Child message must include either status or action")
 
     def _send_request(self, action: str, payload: dict[str, object]) -> dict[str, object]:
         """Send one request and return its decoded top-level response.
@@ -883,10 +1198,10 @@ class ExtraditeSession:
 
             try:
                 connection.send(request)
-            except (BrokenPipeError, OSError) as exc:
+            except (BrokenPipeError, EOFError, OSError) as exc:
                 raise ExtraditeProtocolError("Failed to send request to child process") from exc
 
-            return self._receive_response(expected_request_id=request_id)
+            return self._wait_for_response(expected_request_id=request_id)
 
     def construct_instance(self, class_object_id: int, args: list[object], kwargs: dict[str, object]) -> int:
         """Construct a remote class instance.
@@ -896,10 +1211,10 @@ class ExtraditeSession:
         :param kwargs: Constructor keyword arguments.
         :returns: Remote object identifier.
         """
-        encoded_args: list[object] = [self._encode_argument(item) for item in args]
+        encoded_args: list[object] = [self._encode_for_child(item) for item in args]
         encoded_kwargs: dict[str, object] = {}
         for key, value in kwargs.items():
-            encoded_kwargs[key] = self._encode_argument(value)
+            encoded_kwargs[key] = self._encode_for_child(value)
 
         response: dict[str, object] = self._send_request(
             "construct",
@@ -945,7 +1260,7 @@ class ExtraditeSession:
             return _RemoteCallProxy(self, object_id, attr_name)
 
         encoded_value: object = payload.get("value")
-        return self._decode_value(encoded_value)
+        return self._decode_from_child(encoded_value)
 
     def call_attr(
         self,
@@ -962,10 +1277,10 @@ class ExtraditeSession:
         :param kwargs: Keyword arguments.
         :returns: Decoded call result.
         """
-        encoded_args: list[object] = [self._encode_argument(item) for item in args]
+        encoded_args: list[object] = [self._encode_for_child(item) for item in args]
         encoded_kwargs: dict[str, object] = {}
         for key, value in kwargs.items():
-            encoded_kwargs[key] = self._encode_argument(value)
+            encoded_kwargs[key] = self._encode_for_child(value)
 
         response: dict[str, object] = self._send_request(
             "call_attr",
@@ -982,7 +1297,7 @@ class ExtraditeSession:
             raise ExtraditeProtocolError("call_attr payload must be a dict")
 
         encoded_value: object = payload.get("value")
-        return self._decode_value(encoded_value)
+        return self._decode_from_child(encoded_value)
 
     def set_attr(self, object_id: int, attr_name: str, value: object) -> None:
         """Set an attribute on a remote object.
@@ -991,7 +1306,7 @@ class ExtraditeSession:
         :param attr_name: Attribute name.
         :param value: New value.
         """
-        encoded_value: object = self._encode_argument(value)
+        encoded_value: object = self._encode_for_child(value)
         self._send_request(
             "set_attr",
             {
@@ -1030,7 +1345,8 @@ class ExtraditeSession:
 
         :param object_id: Remote object identifier.
         """
-        self._proxy_cache.pop(object_id, None)
+        self._instance_proxy_cache.pop(object_id, None)
+        self._handle_proxy_cache.pop(object_id, None)
         self._send_request(
             "release_object",
             {
@@ -1038,25 +1354,39 @@ class ExtraditeSession:
             },
         )
 
-    def get_or_create_proxy(
+    def get_or_create_instance_proxy(
         self,
         object_id: int,
         proxy_type: type[ExtraditedObjectBase],
     ) -> ExtraditedObjectBase:
-        """Get a cached proxy or create a new one.
+        """Get a cached class-instance proxy or create a new one.
 
         :param object_id: Remote object identifier.
         :param proxy_type: Desired proxy class.
         :returns: Bound proxy object.
         """
-        cached: ExtraditedObjectBase | None = self._proxy_cache.get(object_id)
+        cached: ExtraditedObjectBase | None = self._instance_proxy_cache.get(object_id)
         if cached is not None:
             return cached
 
         instance: ExtraditedObjectBase = object.__new__(proxy_type)
         bound: ExtraditedObjectBase = proxy_type._bind_remote(instance, object_id)
-        self._proxy_cache[object_id] = bound
+        self._instance_proxy_cache[object_id] = bound
         return bound
+
+    def get_or_create_handle_proxy(self, object_id: int) -> _RemoteHandleProxy:
+        """Get a cached generic handle proxy or create a new one.
+
+        :param object_id: Remote object identifier.
+        :returns: Generic handle proxy.
+        """
+        cached: _RemoteHandleProxy | None = self._handle_proxy_cache.get(object_id)
+        if cached is not None:
+            return cached
+
+        created: _RemoteHandleProxy = _RemoteHandleProxy(self, object_id)
+        self._handle_proxy_cache[object_id] = created
+        return created
 
     def close(self) -> None:
         """Close the session and terminate the child process."""
@@ -1078,7 +1408,7 @@ class ExtraditeSession:
                     }
                     connection.send(request)
                     self._next_request_id += 1
-                except (BrokenPipeError, OSError):
+                except (BrokenPipeError, EOFError, OSError):
                     pass
 
                 try:
@@ -1095,7 +1425,9 @@ class ExtraditeSession:
 
             self._connection = None
             self._process = None
-            self._proxy_cache.clear()
+            self._instance_proxy_cache.clear()
+            self._handle_proxy_cache.clear()
+            self._local_object_registry.clear()
             self._class_object_ids_by_target.clear()
             self._target_reference_counts.clear()
             self._protected_module_names.clear()
@@ -1188,6 +1520,7 @@ def create_extradited_class(target: str, share_key: str | None = None) -> type:
         session.start()
         class_object_id: int = session.register_target(module_name, class_qualname)
     except Exception:
+        traceback.format_exc()
         if is_new_session is True:
             session.close()
         raise
