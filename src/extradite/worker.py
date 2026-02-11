@@ -6,6 +6,7 @@ import traceback
 import weakref
 from multiprocessing.connection import Connection
 from typing import Any
+from typing import Literal
 
 from extradite.errors import ExtraditeProtocolError
 from extradite.errors import UnsupportedInteractionError
@@ -14,6 +15,7 @@ WIRE_PICKLE_TAG: str = "__extradite_transport_pickle_v1__"
 WIRE_REF_TAG: str = "__extradite_transport_ref_v1__"
 OWNER_PARENT: str = "parent"
 OWNER_CHILD: str = "child"
+TransportPolicy = Literal["value", "reference"]
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -132,6 +134,17 @@ def _value_originates_from_module(
             return True
 
     return False
+
+
+def _is_force_reference_candidate(value: object) -> bool:
+    """Decide whether policy ``reference`` should force handle transport.
+
+    :param value: Candidate runtime value.
+    :returns: ``True`` when value should be sent by reference.
+    """
+    if isinstance(value, (type(None), bool, int, float, complex, str, bytes)) is True:
+        return False
+    return True
 
 
 class ObjectRegistry:
@@ -346,18 +359,6 @@ def _require_str_field(message: dict[str, object], key: str) -> str:
     return value
 
 
-def _finalize_parent_object(runtime_ref: "weakref.ReferenceType[WorkerRuntime]", object_id: int) -> None:
-    """Finalize one parent-owned remote handle proxy.
-
-    :param runtime_ref: Weak reference to runtime.
-    :param object_id: Parent-owned object identifier.
-    """
-    runtime: WorkerRuntime | None = runtime_ref()
-    if runtime is None:
-        return
-    runtime.release_parent_object_safely(object_id)
-
-
 class _ParentCallProxy:
     """Call wrapper for parent-owned callable attributes."""
 
@@ -391,7 +392,7 @@ class _ParentRemoteHandle:
 
     _runtime: "WorkerRuntime"
     _remote_object_id: int
-    _finalizer: weakref.finalize
+    _is_closed: bool
 
     def __init__(self, runtime: "WorkerRuntime", object_id: int) -> None:
         """Initialize a parent remote handle proxy.
@@ -401,9 +402,7 @@ class _ParentRemoteHandle:
         """
         object.__setattr__(self, "_runtime", runtime)
         object.__setattr__(self, "_remote_object_id", object_id)
-        runtime_ref: "weakref.ReferenceType[WorkerRuntime]" = weakref.ref(runtime)
-        finalizer: weakref.finalize = weakref.finalize(self, _finalize_parent_object, runtime_ref, object_id)
-        object.__setattr__(self, "_finalizer", finalizer)
+        object.__setattr__(self, "_is_closed", False)
 
     @property
     def remote_object_id(self) -> int:
@@ -415,9 +414,11 @@ class _ParentRemoteHandle:
 
     def close(self) -> None:
         """Release this parent-owned handle."""
-        was_alive: bool = self._finalizer.alive
-        if was_alive is True:
-            self._finalizer()
+        already_closed: bool = self._is_closed
+        if already_closed is True:
+            return
+        object.__setattr__(self, "_is_closed", True)
+        self._runtime.release_parent_object(self._remote_object_id)
 
     def __getattr__(self, attr_name: str) -> object:
         """Resolve attributes from the parent process.
@@ -632,6 +633,38 @@ class _ParentRemoteHandle:
         """
         return self._runtime.call_parent_attr(self._remote_object_id, "__call__", list(args), kwargs)
 
+    def __instancecheck__(self, instance: object) -> bool:
+        """Evaluate ``isinstance(instance, self)`` against parent class handles.
+
+        :param instance: Candidate instance.
+        :returns: ``True`` when parent-side ``isinstance`` succeeds.
+        """
+        value: object = self._runtime.call_parent_attr(
+            self._remote_object_id,
+            "__instancecheck__",
+            [instance],
+            {},
+        )
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __instancecheck__ did not return bool")
+        return value
+
+    def __subclasscheck__(self, subclass: object) -> bool:
+        """Evaluate ``issubclass(subclass, self)`` against parent class handles.
+
+        :param subclass: Candidate subclass.
+        :returns: ``True`` when parent-side ``issubclass`` succeeds.
+        """
+        value: object = self._runtime.call_parent_attr(
+            self._remote_object_id,
+            "__subclasscheck__",
+            [subclass],
+            {},
+        )
+        if isinstance(value, bool) is False:
+            raise ExtraditeProtocolError("Remote __subclasscheck__ did not return bool")
+        return value
+
     def __enter__(self) -> object:
         """Enter remote context manager.
 
@@ -671,17 +704,28 @@ class WorkerRuntime:
     _connection: Connection
     _registry: ObjectRegistry
     _protected_module_names: set[str]
+    _transport_policy: TransportPolicy
     _next_request_id: int
     _parent_proxy_cache: "weakref.WeakValueDictionary[int, _ParentRemoteHandle]"
 
-    def __init__(self, connection: Connection) -> None:
+    def __init__(self, connection: Connection, transport_policy: TransportPolicy = "value") -> None:
         """Initialize worker runtime state.
 
         :param connection: Bidirectional IPC connection to the parent process.
+        :param transport_policy: Wire transport policy for picklable values.
+        :raises ValueError: If transport policy is unsupported.
         """
+        allowed_policies: set[str] = {"value", "reference"}
+        is_allowed: bool = transport_policy in allowed_policies
+        if is_allowed is False:
+            raise ValueError(
+                "transport_policy must be one of: "
+                + ", ".join(sorted(allowed_policies))
+            )
         self._connection = connection
         self._registry = ObjectRegistry()
         self._protected_module_names = set()
+        self._transport_policy = transport_policy
         self._next_request_id = 1
         self._parent_proxy_cache = weakref.WeakValueDictionary()
 
@@ -845,6 +889,21 @@ class WorkerRuntime:
         if isinstance(value, _ParentRemoteHandle) is True:
             return (WIRE_REF_TAG, OWNER_PARENT, value.remote_object_id)
 
+        seen_ids: set[int] = set()
+        contains_protected: bool = _value_originates_from_module(value, self._protected_module_names, seen_ids)
+        if contains_protected is True:
+            raise UnsupportedInteractionError(
+                "Refusing to transfer values that originate from the protected isolated module"
+            )
+
+        force_reference: bool = (
+            self._transport_policy == "reference"
+            and _is_force_reference_candidate(value) is True
+        )
+        if force_reference is True:
+            object_id_force_ref: int = self._registry.store(value)
+            return (WIRE_REF_TAG, OWNER_CHILD, object_id_force_ref)
+
         if isinstance(value, list) is True:
             return [self._encode_for_parent(item) for item in value]
 
@@ -876,13 +935,6 @@ class WorkerRuntime:
                 encoded_item: object = self._encode_for_parent(item)
                 encoded_dict[encoded_key] = encoded_item
             return encoded_dict
-
-        seen_ids: set[int] = set()
-        contains_protected: bool = _value_originates_from_module(value, self._protected_module_names, seen_ids)
-        if contains_protected is True:
-            raise UnsupportedInteractionError(
-                "Refusing to transfer values that originate from the protected isolated module"
-            )
 
         try:
             payload: bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1183,16 +1235,6 @@ class WorkerRuntime:
             },
         )
 
-    def release_parent_object_safely(self, object_id: int) -> None:
-        """Best-effort parent handle release for finalizers.
-
-        :param object_id: Parent-owned object identifier.
-        """
-        try:
-            self.release_parent_object(object_id)
-        except (ExtraditeProtocolError, _RemotePeerError, OSError):
-            return
-
     def release_parent_object(self, object_id: int) -> None:
         """Release one parent-owned object handle.
 
@@ -1207,10 +1249,11 @@ class WorkerRuntime:
         )
 
 
-def worker_entry(connection: Connection) -> None:
+def worker_entry(connection: Connection, transport_policy: TransportPolicy = "value") -> None:
     """Run the child interpreter message loop.
 
     :param connection: IPC connection from parent process.
+    :param transport_policy: Wire transport policy for picklable values.
     """
-    runtime: WorkerRuntime = WorkerRuntime(connection)
+    runtime: WorkerRuntime = WorkerRuntime(connection, transport_policy=transport_policy)
     runtime.run()

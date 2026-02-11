@@ -12,6 +12,7 @@ from collections.abc import Callable
 from multiprocessing.connection import Connection
 from typing import Any
 from typing import ClassVar
+from typing import Literal
 
 from extradite.errors import ExtraditeModuleLeakError
 from extradite.errors import ExtraditeProtocolError
@@ -25,6 +26,7 @@ from extradite.worker import worker_entry
 
 _SHARED_SESSION_LOCK: threading.RLock = threading.RLock()
 _SHARED_SESSIONS_BY_KEY: dict[str, "ExtraditeSession"] = {}
+TransportPolicy = Literal["value", "reference"]
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -140,6 +142,31 @@ def _safe_unpickle(payload: bytes, protected_module_names: set[str]) -> object:
         raise
     except (pickle.UnpicklingError, EOFError, AttributeError, ValueError) as exc:
         raise ExtraditeProtocolError("Failed to unpickle child payload") from exc
+
+
+def _validate_transport_policy(transport_policy: str) -> TransportPolicy:
+    """Validate and normalize transport policy values.
+
+    :param transport_policy: Requested transport policy.
+    :returns: Validated transport policy.
+    :raises ValueError: If policy is unsupported.
+    """
+    if transport_policy == "value":
+        return "value"
+    if transport_policy == "reference":
+        return "reference"
+    raise ValueError("transport_policy must be one of: reference, value")
+
+
+def _is_force_reference_candidate(value: object) -> bool:
+    """Decide whether policy ``reference`` should force handle transport.
+
+    :param value: Candidate runtime value.
+    :returns: ``True`` when value should be sent by reference.
+    """
+    if isinstance(value, (type(None), bool, int, float, complex, str, bytes)) is True:
+        return False
+    return True
 
 
 class _LocalObjectRegistry:
@@ -643,6 +670,7 @@ class ExtraditeSession:
     """Manage one child interpreter and its IPC channel."""
 
     _share_key: str | None
+    _transport_policy: TransportPolicy
     _close_callback: Callable[[], None] | None
     _connection: Connection | None
     _process: multiprocessing.Process | None
@@ -656,13 +684,20 @@ class ExtraditeSession:
     _class_object_ids_by_target: dict[str, int]
     _target_reference_counts: dict[str, int]
 
-    def __init__(self, share_key: str | None = None, close_callback: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        share_key: str | None = None,
+        close_callback: Callable[[], None] | None = None,
+        transport_policy: TransportPolicy = "value",
+    ) -> None:
         """Initialize a session.
 
         :param share_key: Optional share key used by the session registry.
         :param close_callback: Optional callback invoked once when the session closes.
+        :param transport_policy: Wire transport policy for picklable values.
         """
         self._share_key = share_key
+        self._transport_policy = transport_policy
         self._close_callback = close_callback
         self._connection = None
         self._process = None
@@ -696,7 +731,7 @@ class ExtraditeSession:
             parent_connection, child_connection = context.Pipe(duplex=True)
             process = context.Process(
                 target=worker_entry,
-                args=(child_connection,),
+                args=(child_connection, self._transport_policy),
             )
             process.daemon = True
             process.start()
@@ -942,6 +977,14 @@ class ExtraditeSession:
                 )
             return (WIRE_REF_TAG, OWNER_CHILD, value.remote_object_id)
 
+        force_reference: bool = (
+            self._transport_policy == "reference"
+            and _is_force_reference_candidate(value) is True
+        )
+        if force_reference is True:
+            object_id_force_ref: int = self._local_object_registry.store(value)
+            return (WIRE_REF_TAG, OWNER_PARENT, object_id_force_ref)
+
         if isinstance(value, list) is True:
             return [self._encode_for_child(item) for item in value]
 
@@ -1072,7 +1115,20 @@ class ExtraditeSession:
             if callable_flag is False:
                 raise ExtraditeProtocolError(f"Attribute {attr_name_obj!r} is not callable")
 
-            result: object = callable_obj(*args, **kwargs)  # type: ignore[operator]
+            target_is_type: bool = isinstance(target, type)
+            repr_or_str_call: bool = (
+                target_is_type is True
+                and (attr_name_obj == "__repr__" or attr_name_obj == "__str__")
+                and len(args) == 0
+                and len(kwargs) == 0
+            )
+            if repr_or_str_call is True:
+                if attr_name_obj == "__repr__":
+                    result = repr(target)
+                else:
+                    result = str(target)
+            else:
+                result = callable_obj(*args, **kwargs)  # type: ignore[operator]
             return {"value": self._encode_for_child(result)}
 
         if action == "release_object":
@@ -1450,23 +1506,35 @@ def _remove_shared_session_if_current(share_key: str, session: ExtraditeSession)
             _SHARED_SESSIONS_BY_KEY.pop(share_key, None)
 
 
-def _get_or_create_shared_session(share_key: str) -> tuple[ExtraditeSession, bool]:
+def _get_or_create_shared_session(
+    share_key: str,
+    transport_policy: TransportPolicy,
+) -> tuple[ExtraditeSession, bool]:
     """Get or create a shared session for ``share_key``.
 
     :param share_key: Shared-session key.
+    :param transport_policy: Requested transport policy.
     :returns: Tuple of ``(session, was_created)``.
+    :raises ValueError: If an active shared session has a conflicting policy.
     """
     with _SHARED_SESSION_LOCK:
         existing: ExtraditeSession | None = _SHARED_SESSIONS_BY_KEY.get(share_key)
         if existing is not None:
             is_closed: bool = existing.is_closed
             if is_closed is False:
+                same_policy: bool = existing._transport_policy == transport_policy
+                if same_policy is False:
+                    raise ValueError(
+                        "share_key already exists with transport_policy="
+                        + f"{existing._transport_policy!r}; requested {transport_policy!r}"
+                    )
                 return existing, False
             _SHARED_SESSIONS_BY_KEY.pop(share_key, None)
 
         session = ExtraditeSession(
             share_key=share_key,
             close_callback=lambda: _remove_shared_session_if_current(share_key, session),
+            transport_policy=transport_policy,
         )
         _SHARED_SESSIONS_BY_KEY[share_key] = session
         return session, True
@@ -1499,22 +1567,31 @@ def _build_proxy_class(
     return proxy_class
 
 
-def create_extradited_class(target: str, share_key: str | None = None) -> type:
+def create_extradited_class(
+    target: str,
+    share_key: str | None = None,
+    transport_policy: TransportPolicy = "value",
+) -> type:
     """Create a class proxy for an isolated import target.
 
     :param target: Target in ``module.path:ClassName`` format.
     :param share_key: Optional key that reuses a child process across calls.
+    :param transport_policy: Wire transport policy for picklable values.
     :returns: Dynamic proxy class for that target.
     :raises ExtraditeModuleLeakError: If target module already leaked into root process.
     """
+    validated_transport_policy: TransportPolicy = _validate_transport_policy(transport_policy)
     module_name, class_qualname = _parse_target(target)
     session: ExtraditeSession
     is_new_session: bool
     if share_key is None:
-        session = ExtraditeSession()
+        session = ExtraditeSession(transport_policy=validated_transport_policy)
         is_new_session = True
     else:
-        session, is_new_session = _get_or_create_shared_session(share_key)
+        session, is_new_session = _get_or_create_shared_session(
+            share_key,
+            validated_transport_policy,
+        )
 
     try:
         session.start()
