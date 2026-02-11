@@ -170,6 +170,47 @@ python3.14 examples/subinterpreter_extradite_demo.py
 
 The demo intentionally targets `readline` through `extradite.demo.native_dependency_workload`, because `readline` is a native module that reports unsupported subinterpreter loading in Python 3.14. The extradited phase exercises real `readline` APIs (`clear_history`, `add_history`, `get_history_item`, and completer-delimiter configuration), then validates those outputs in the subinterpreter driver.
 
+## Performance benchmark
+
+A comprehensive benchmark is provided at `benchmarks/extradite_performance_benchmark.py`.
+
+It compares direct execution against `extradite` across diverse regimes:
+
+- cold startup + first call
+- tiny call overhead
+- repeated small state mutations
+- small structured payload transport
+- large list payload transport
+- large bytes round-trip transport
+- callback-heavy re-entrant interactions
+- native `readline` operations
+- CPU-heavy PBKDF2 operations
+- coarse-grained mixed pipelines
+
+Run the full benchmark:
+
+```bash
+PYTHONPATH=src python3.14 benchmarks/extradite_performance_benchmark.py
+```
+
+Run a quicker smoke pass:
+
+```bash
+PYTHONPATH=src python3.14 benchmarks/extradite_performance_benchmark.py --quick --repetitions 2
+```
+
+Write raw per-run data to JSON:
+
+```bash
+PYTHONPATH=src python3.14 benchmarks/extradite_performance_benchmark.py --json-output benchmark-results.json
+```
+
+Select specific regimes:
+
+```bash
+PYTHONPATH=src python3.14 benchmarks/extradite_performance_benchmark.py --cases tiny_ping,readline_digest,mixed_pipeline
+```
+
 ## License
 
 Apache License 2.0 (`LICENSE`).
