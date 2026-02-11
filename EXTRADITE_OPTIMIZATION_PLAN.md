@@ -2,7 +2,7 @@
 
 Last updated: 2026-02-11
 Owner: Codex + Tanmay
-Status: Phase 1 implemented; Phases 2-6 pending
+Status: Phases 1-2 implemented; Phases 3-6 pending
 
 ## Purpose
 
@@ -49,7 +49,7 @@ Baseline median results:
 | Phase | Name | Status | Primary Regimes Impacted |
 | --- | --- | --- | --- |
 | 1 | Remove Per-Request Leak-Scan Overhead | Completed (2026-02-11) | `tiny_ping`, `increment_small`, `payload_small_checksum`, `readline_digest` |
-| 2 | Structured Payload Transport Fast-Path | Not Started | `payload_large_sum`, `payload_small_checksum`, `mixed_pipeline` |
+| 2 | Structured Payload Transport Fast-Path | Completed (2026-02-11) | `payload_large_sum`, `payload_small_checksum`, `mixed_pipeline` |
 | 3 | Batched RPC for Chatty Calls | Not Started | `tiny_ping`, `increment_small`, `readline_digest` |
 | 4 | Callback-Batch Bridge | Not Started | `callback_chatter` |
 | 5 | Shared-Memory Binary Transport | Not Started | `bytes_roundtrip_512kb`, large binary workloads |
@@ -143,6 +143,44 @@ Avoid recursive per-element encoding for large picklable container payloads.
 - Policy precedence tests remain green.
 - Bench target:
   - `payload_large_sum` median `us/op` improves by at least 40%.
+
+### Implementation Notes (2026-02-11)
+
+- Added bulk pickle fast-path for large container payloads in:
+  - `src/extradite/runtime.py` (parent -> child)
+  - `src/extradite/worker.py` (child -> parent)
+- Fast-path constraints:
+  - only for large containers (`list`, `tuple`, `set`, `frozenset`, `dict`);
+  - only in effective `value` policy mode;
+  - for parent -> child, disabled when per-type rules are active and no per-call override is present (to preserve nested type-rule semantics).
+- Preserved recursive fallback behavior for mixed/handle-containing containers when bulk pickle fails.
+- Added deterministic tests:
+  - `test_large_picklable_container_roundtrip_in_value_mode`
+  - `test_nested_type_rule_reference_semantics_without_call_override`
+  - `test_call_override_value_applies_to_nested_type_rule_payloads`
+  - `test_large_container_fallback_roundtrips_unpicklable_nested_values`
+
+### Phase 2 Result Snapshot (Targeted Regimes)
+
+Source runs:
+
+```bash
+PYTHONPATH=src python3 benchmarks/extradite_performance_benchmark.py --repetitions 5 --cases payload_large_sum,payload_small_checksum,mixed_pipeline --json-output /tmp/extradite-phase2-before.json
+PYTHONPATH=src python3 benchmarks/extradite_performance_benchmark.py --repetitions 5 --cases payload_large_sum,payload_small_checksum,mixed_pipeline --json-output /tmp/extradite-phase2-after.json
+```
+
+Extradite median `us/op` before vs after:
+
+| Regime | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `payload_large_sum` | 7875.700 | 248.377 | -96.85% |
+| `payload_small_checksum` | 38.370 | 37.606 | -1.99% |
+| `mixed_pipeline` | 3272.039 | 2837.936 | -13.27% |
+
+Summary:
+
+- `payload_large_sum` exceeded the phase target by a wide margin.
+- All three targeted Phase 2 regimes improved.
 
 ---
 

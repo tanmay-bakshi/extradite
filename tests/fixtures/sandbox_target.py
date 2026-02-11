@@ -79,6 +79,50 @@ class IsolatedCounter:
             raise TypeError("callback must return int")
         return result
 
+    def callback_from_payload(self, payload: list[object], value: int) -> int:
+        """Invoke the last payload item as a callback and return its integer result.
+
+        :param payload: Payload list whose final item must be callable.
+        :param value: Input value passed to the callback.
+        :returns: Integer callback result.
+        :raises ValueError: If ``payload`` is empty.
+        :raises TypeError: If callback is not callable or result is not integer.
+        """
+        payload_length: int = len(payload)
+        if payload_length == 0:
+            raise ValueError("payload must contain at least one item")
+
+        callback_obj: object = payload[payload_length - 1]
+        callback_is_callable: bool = callable(callback_obj)
+        if callback_is_callable is False:
+            raise TypeError("payload last item must be callable")
+
+        result_obj: object = callback_obj(value)  # type: ignore[operator]
+        if isinstance(result_obj, int) is False:
+            raise TypeError("payload callback must return int")
+        return result_obj
+
+    def set_nested_item_value(self, payload: dict[str, object], updated_value: int) -> int:
+        """Set ``payload['items'][0].value`` and return the updated integer value.
+
+        :param payload: Payload containing key ``items`` mapped to a list-like value.
+        :param updated_value: Integer assigned to ``items[0].value``.
+        :returns: The resulting integer value from ``items[0].value``.
+        :raises TypeError: If payload structure is invalid.
+        """
+        items_obj: object = payload.get("items")
+        if isinstance(items_obj, list) is False:
+            raise TypeError("payload['items'] must be a list")
+        if len(items_obj) < 1:
+            raise TypeError("payload['items'] must contain at least one item")
+
+        first_obj: object = items_obj[0]
+        setattr(first_obj, "value", updated_value)
+        value_obj: object = getattr(first_obj, "value")
+        if isinstance(value_obj, int) is False:
+            raise TypeError("payload['items'][0].value must be int")
+        return value_obj
+
     def echo(self, value: object) -> object:
         """Return one value unchanged.
 

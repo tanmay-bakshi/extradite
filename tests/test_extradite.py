@@ -404,6 +404,101 @@ def test_default_value_mode_copies_identity_as_documented() -> None:
         counter_cls.close()
 
 
+def test_large_picklable_container_roundtrip_in_value_mode() -> None:
+    """Large list payloads should roundtrip with value semantics."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        payload: list[int] = list(range(4_096))
+        returned_obj: object = counter.echo(payload)
+        assert isinstance(returned_obj, list) is True
+        returned: list[object] = returned_obj
+        assert returned == payload
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_nested_type_rule_reference_semantics_without_call_override() -> None:
+    """Nested type-rule matches should still preserve identity by reference."""
+    counter_cls: type = extradite(
+        TARGET,
+        transport_policy="value",
+        transport_type_rules={PicklablePayload: "reference"},
+    )
+    counter = None
+    try:
+        counter = counter_cls(1)
+        payload_items: list[PicklablePayload] = [PicklablePayload(10), PicklablePayload(20)]
+        payload: dict[str, object] = {"items": payload_items}
+
+        updated_value: int = 999
+        result_obj: object = counter.set_nested_item_value(payload, updated_value)
+        assert result_obj == updated_value
+        assert payload_items[0].value == updated_value
+        assert payload_items[1].value == 20
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_call_override_value_applies_to_nested_type_rule_payloads() -> None:
+    """Per-call value override should copy nested values even with type rules configured."""
+    counter_cls: type = extradite(
+        TARGET,
+        transport_policy="value",
+        transport_type_rules={PicklablePayload: "reference"},
+    )
+    counter = None
+    try:
+        counter = counter_cls(1)
+        payload_items: list[PicklablePayload] = [PicklablePayload(31), PicklablePayload(41)]
+        payload: dict[str, object] = {"items": payload_items}
+
+        updated_value: int = 222
+        result_obj: object = counter.set_nested_item_value(
+            payload,
+            updated_value,
+            __extradite_policy__="value",
+        )
+        assert result_obj == updated_value
+        assert payload_items[0].value == 31
+        assert payload_items[1].value == 41
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
+def test_large_container_fallback_roundtrips_unpicklable_nested_values() -> None:
+    """Large containers with unpicklable nested values should fall back to recursive encoding."""
+    counter_cls: type = extradite(TARGET)
+    counter = None
+    try:
+        counter = counter_cls(1)
+        offset: int = 13
+
+        def callback(value: int) -> int:
+            """Compute one callback score.
+
+            :param value: Input value.
+            :returns: Incremented score.
+            """
+            return value + offset
+
+        payload: list[object] = list(range(40))
+        payload.append(callback)
+        result_obj: object = counter.callback_from_payload(payload, 5)
+        assert result_obj == 18
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+
+
 def test_invalid_transport_policy_fails_fast() -> None:
     """Invalid transport policy configuration should fail fast in the caller."""
     with pytest.raises(ValueError, match="transport_policy"):

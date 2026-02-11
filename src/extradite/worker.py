@@ -16,6 +16,7 @@ WIRE_REF_TAG: str = "__extradite_transport_ref_v1__"
 OWNER_PARENT: str = "parent"
 OWNER_CHILD: str = "child"
 TransportPolicy = Literal["value", "reference"]
+_BULK_PICKLE_MIN_ITEMS: int = 32
 _PARENT_TYPE_PROXY_RUNTIME_ATTR: str = "__extradite_parent_type_proxy_runtime__"
 _PARENT_TYPE_PROXY_OBJECT_ID_ATTR: str = "__extradite_parent_type_proxy_object_id__"
 
@@ -147,6 +148,57 @@ def _is_force_reference_candidate(value: object) -> bool:
     if isinstance(value, (type(None), bool, int, float, complex, str, bytes)) is True:
         return False
     return True
+
+
+def _is_bulk_pickle_container_candidate(value: object) -> bool:
+    """Report whether ``value`` is a container eligible for bulk pickle transport.
+
+    :param value: Candidate runtime value.
+    :returns: ``True`` when ``value`` is a supported container type.
+    """
+    if isinstance(value, list) is True:
+        return True
+    if isinstance(value, tuple) is True:
+        return True
+    if isinstance(value, set) is True:
+        return True
+    if isinstance(value, frozenset) is True:
+        return True
+    if isinstance(value, dict) is True:
+        return True
+    return False
+
+
+def _container_item_count(value: object) -> int:
+    """Return the number of top-level items in one supported container value.
+
+    :param value: Container value.
+    :returns: Top-level item count.
+    :raises TypeError: If ``value`` is not a supported container.
+    """
+    if isinstance(value, list) is True:
+        return len(value)
+    if isinstance(value, tuple) is True:
+        return len(value)
+    if isinstance(value, set) is True:
+        return len(value)
+    if isinstance(value, frozenset) is True:
+        return len(value)
+    if isinstance(value, dict) is True:
+        return len(value)
+    raise TypeError("value must be a supported container")
+
+
+def _try_pickle_payload(value: object) -> bytes | None:
+    """Try to pickle one value and return payload bytes on success.
+
+    :param value: Runtime value to pickle.
+    :returns: Pickle payload bytes or ``None`` when pickling fails.
+    """
+    try:
+        return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    except (pickle.PicklingError, TypeError, AttributeError, ValueError):
+        return None
 
 
 def _extract_parent_type_proxy_object_id(value: object) -> int | None:
@@ -1116,6 +1168,20 @@ class WorkerRuntime:
             setattr(parent_instance, key, item)
         return parent_instance
 
+    def _should_try_bulk_pickle_for_parent(self, value: object) -> bool:
+        """Decide whether container ``value`` should use bulk pickle transport.
+
+        :param value: Candidate runtime value.
+        :returns: ``True`` when bulk pickle should be attempted first.
+        """
+        if self._transport_policy != "value":
+            return False
+
+        container_item_count: int = _container_item_count(value)
+        if container_item_count < _BULK_PICKLE_MIN_ITEMS:
+            return False
+        return True
+
     def _encode_for_parent(self, value: object) -> object:
         """Encode one runtime value for transport to the parent.
 
@@ -1151,6 +1217,14 @@ class WorkerRuntime:
             object_id_force_ref: int = self._registry.store(value)
             return (WIRE_REF_TAG, OWNER_CHILD, object_id_force_ref)
 
+        is_container_candidate: bool = _is_bulk_pickle_container_candidate(value)
+        if is_container_candidate is True:
+            should_try_bulk_pickle: bool = self._should_try_bulk_pickle_for_parent(value)
+            if should_try_bulk_pickle is True:
+                bulk_payload: bytes | None = _try_pickle_payload(value)
+                if bulk_payload is not None:
+                    return (WIRE_PICKLE_TAG, bulk_payload)
+
         if isinstance(value, list) is True:
             return [self._encode_for_parent(item) for item in value]
 
@@ -1183,12 +1257,12 @@ class WorkerRuntime:
                 encoded_dict[encoded_key] = encoded_item
             return encoded_dict
 
-        try:
-            payload: bytes = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        payload: bytes | None = _try_pickle_payload(value)
+        if payload is not None:
             return (WIRE_PICKLE_TAG, payload)
-        except (pickle.PicklingError, TypeError, AttributeError, ValueError):
-            object_id: int = self._registry.store(value)
-            return (WIRE_REF_TAG, OWNER_CHILD, object_id)
+
+        object_id: int = self._registry.store(value)
+        return (WIRE_REF_TAG, OWNER_CHILD, object_id)
 
     def _decode_args_from_parent(self, message: dict[str, object]) -> tuple[list[object], dict[str, object]]:
         """Decode args/kwargs from a request message.
