@@ -69,10 +69,12 @@ This prevents protected-module leakage through marshal/unmarshal transfer paths.
 
 ## API
 
-### `extradite(target: str, share_key: str | None = None, transport_policy: str = "value", transport_type_rules: dict[type, str] | None = None) -> type`
+### `extradite(target: str, share_key: str | None = None, transport_policy: str = "value", transport_type_rules: dict[type, str] | None = None, share_keepalive_seconds: float | None = None) -> type`
 
 - `target` format: `"module.path:ClassName"`.
 - `share_key` is optional; when provided, calls with the same key reuse one backing child process.
+- `share_keepalive_seconds` is optional; when `share_key` is set, it keeps the shared child process alive for that many idle seconds after the last class handle is closed.
+  - `share_keepalive_seconds` requires `share_key`.
 - `transport_policy` controls picklable-value transport behavior:
   - `"value"` (default): transfer picklable values by copy.
   - `"reference"`: force handle transport for non-scalar values, preserving identity.
@@ -80,6 +82,16 @@ This prevents protected-module leakage through marshal/unmarshal transfer paths.
 - returns a dynamic proxy class.
 - constructing that proxy creates remote instances in the child process.
 - default behavior is unchanged: without `share_key`, each call gets its own child process.
+
+### Shared-session lifecycle helpers
+
+- `prewarm_extradite_session(share_key: str, transport_policy: str = "value", transport_type_rules: dict[type, str] | None = None, share_keepalive_seconds: float | None = None) -> bool`
+  - creates (or reuses) one shared session and eagerly starts its child process;
+  - when creating a new session and `share_keepalive_seconds` is omitted, a default keepalive of `30.0` seconds is used;
+  - returns `True` when a new shared session was created.
+- `close_extradite_session(share_key: str) -> bool`
+  - closes one active shared session immediately;
+  - returns `True` when a matching session was found.
 
 ### Policy precedence
 
@@ -169,9 +181,11 @@ These preserve the original remote exception type, message, and traceback text.
 - The target module must not be imported in the root process before creating the proxy.
 - Passing proxy objects between different proxy sessions is disallowed.
 - Some advanced Python interactions may be unsupported and raise `UnsupportedInteractionError`.
-- If you use `share_key`, `Class.close()` releases that class handle; the shared child process exits when the last handle for that key is closed.
+- If you use `share_key` without keepalive, `Class.close()` releases that class handle and the shared child process exits when the last handle for that key is closed.
+- If you use `share_key` with `share_keepalive_seconds > 0`, `Class.close()` may leave the process warm until the keepalive timeout expires or `close_extradite_session(share_key)` is called.
 - If you reuse a `share_key`, all calls must use the same `transport_policy`.
 - If you reuse a `share_key`, all calls must also use the same `transport_type_rules` configuration and ordering.
+- If you reuse a `share_key` and explicitly pass `share_keepalive_seconds`, it must match the existing shared session configuration.
 - Handle proxies support explicit `close()` and deterministic use-after-release protocol errors.
 
 ## Running tests
@@ -202,6 +216,7 @@ A comprehensive benchmark is provided at `benchmarks/extradite_performance_bench
 It compares direct execution against `extradite` across diverse regimes:
 
 - cold startup + first call
+- cold startup + first call with warm shared-session keepalive
 - tiny call overhead
 - repeated small state mutations
 - small structured payload transport

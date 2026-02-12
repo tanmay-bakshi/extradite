@@ -1,8 +1,8 @@
 # Extradite Optimization Plan (Living Document)
 
-Last updated: 2026-02-11
+Last updated: 2026-02-12
 Owner: Codex + Tanmay
-Status: Phases 1-5 implemented; Phase 6 pending
+Status: Phases 1-6 implemented
 
 ## Purpose
 
@@ -53,7 +53,7 @@ Baseline median results:
 | 3 | Batched RPC for Chatty Calls | Completed (2026-02-11) | `tiny_ping`, `increment_small`, `readline_digest` |
 | 4 | Callback-Batch Bridge | Completed (2026-02-11) | `callback_chatter` |
 | 5 | Shared-Memory Binary Transport | Completed (2026-02-11) | `bytes_roundtrip_512kb`, large binary workloads |
-| 6 | Warm Session Lifecycle / Pooling | Not Started | `cold_start_first_call` |
+| 6 | Warm Session Lifecycle / Pooling | Completed (2026-02-12) | `cold_start_first_call` |
 
 ## Phase 1: Remove Per-Request Leak-Scan Overhead
 
@@ -384,6 +384,51 @@ Amortize startup/teardown costs for workflows with repeated short-lived calls.
 - Bench target:
   - `cold_start_first_call` median `us/op` improves by at least 50% in warm-session mode.
 
+### Implementation Notes (2026-02-12)
+
+- Added shared-session keepalive support:
+  - new `share_keepalive_seconds` argument on `extradite(...)` for `share_key` sessions;
+  - default behavior remains unchanged (`share_key` without keepalive still closes immediately when idle).
+- Added explicit lifecycle APIs:
+  - `prewarm_extradite_session(...)` for eager child startup;
+  - `close_extradite_session(share_key)` for explicit shutdown.
+- Added shared-session idle close timer mechanics in `src/extradite/runtime.py`:
+  - cancel pending idle-close timer on reuse;
+  - schedule close on last-handle release when keepalive is enabled;
+  - preserve compatibility/conflict checks across `transport_policy`, `transport_type_rules`, and explicit keepalive values.
+- Added deterministic tests:
+  - `test_share_keepalive_requires_share_key`
+  - `test_share_key_rejects_conflicting_share_keepalive_seconds`
+  - `test_prewarm_and_close_shared_session_controls_lifecycle`
+  - `test_share_key_keepalive_reuses_running_session_after_class_close`
+  - `test_share_key_keepalive_timeout_closes_idle_session`
+- Added benchmark regime:
+  - `cold_start_first_call_warm_session`
+
+### Phase 6 Result Snapshot (Targeted Regimes)
+
+Source runs:
+
+```bash
+cd /tmp/extradite-phase6-before
+PYTHONPATH=src /Users/tanmaybakshi/extradite/.venv/bin/python benchmarks/extradite_performance_benchmark.py --repetitions 7 --cases cold_start_first_call --json-output /tmp/extradite-phase6-before.json
+cd /Users/tanmaybakshi/extradite
+PYTHONPATH=src .venv/bin/python benchmarks/extradite_performance_benchmark.py --repetitions 7 --cases cold_start_first_call,cold_start_first_call_warm_session --json-output /tmp/extradite-phase6-after.json
+```
+
+Extradite median `us/op` before vs after:
+
+| Regime | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `cold_start_first_call` | 49356.544 | 49455.954 | +0.20% |
+| `cold_start_first_call_warm_session` | 49356.544 (baseline cold) | 3094.819 | -93.73% |
+
+Summary:
+
+- Warm-session mode achieved a `15.95x` speedup (`-93.73%`) versus baseline cold start.
+- The phase target (`>= 50%` improvement in warm-session mode) was exceeded by a wide margin.
+- Default cold behavior stayed effectively flat.
+
 ## Rollout and Validation Strategy
 
 - Implement one phase at a time.
@@ -410,3 +455,7 @@ Amortize startup/teardown costs for workflows with repeated short-lived calls.
 - Created initial 6-phase optimization plan from benchmark + profiling evidence.
 - Recorded baseline metrics and phase-level success criteria.
 - Completed Phase 5 shared-memory binary transport and recorded benchmark deltas.
+
+### 2026-02-12
+
+- Completed Phase 6 warm-session lifecycle/pooling, including keepalive + prewarm APIs and benchmark validation.

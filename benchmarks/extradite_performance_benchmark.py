@@ -24,6 +24,7 @@ _SEED: str = "extradite-benchmark-seed"
 
 _CASE_ORDER: list[str] = [
     "cold_start_first_call",
+    "cold_start_first_call_warm_session",
     "tiny_ping",
     "increment_small",
     "payload_small_checksum",
@@ -39,6 +40,9 @@ _CASE_DESCRIPTIONS: dict[str, str] = {
     "cold_start_first_call": (
         "Cold start: construct workload and run one tiny call per iteration (startup-inclusive)."
     ),
+    "cold_start_first_call_warm_session": (
+        "Cold start with shared-session keepalive: repeated class lifecycles reuse one warmed child."
+    ),
     "tiny_ping": "Tiny call overhead with scalar return values.",
     "increment_small": "State mutation via many small integer method calls.",
     "payload_small_checksum": "Small structured payload marshaling plus light compute.",
@@ -52,6 +56,7 @@ _CASE_DESCRIPTIONS: dict[str, str] = {
 
 _CASE_DEFAULT_ITERATIONS: dict[str, int] = {
     "cold_start_first_call": 20,
+    "cold_start_first_call_warm_session": 20,
     "tiny_ping": 20_000,
     "increment_small": 15_000,
     "payload_small_checksum": 5_000,
@@ -65,6 +70,7 @@ _CASE_DEFAULT_ITERATIONS: dict[str, int] = {
 
 _CASE_QUICK_ITERATIONS: dict[str, int] = {
     "cold_start_first_call": 4,
+    "cold_start_first_call_warm_session": 4,
     "tiny_ping": 2_000,
     "increment_small": 1_500,
     "payload_small_checksum": 500,
@@ -78,6 +84,7 @@ _CASE_QUICK_ITERATIONS: dict[str, int] = {
 
 _CASE_WARMUP_ITERATIONS: dict[str, int] = {
     "cold_start_first_call": 0,
+    "cold_start_first_call_warm_session": 0,
     "tiny_ping": 500,
     "increment_small": 250,
     "payload_small_checksum": 200,
@@ -91,6 +98,7 @@ _CASE_WARMUP_ITERATIONS: dict[str, int] = {
 
 _CASE_INCLUDE_SETUP_IN_TIMING: dict[str, bool] = {
     "cold_start_first_call": True,
+    "cold_start_first_call_warm_session": True,
     "tiny_ping": False,
     "increment_small": False,
     "payload_small_checksum": False,
@@ -129,11 +137,15 @@ def _summary_fingerprint(summary: dict[str, object]) -> int:
 def _create_workload(
     mode: BenchmarkMode,
     rounds: int,
+    share_key: str | None = None,
+    share_keepalive_seconds: float | None = None,
 ) -> tuple[object, type | None]:
     """Create one benchmark workload object in the requested mode.
 
     :param mode: Execution mode.
     :param rounds: Hash rounds used by the workload.
+    :param share_key: Optional shared-session key for extradite mode.
+    :param share_keepalive_seconds: Optional shared-session keepalive timeout.
     :returns: Tuple of ``(workload_instance, proxy_type_or_none)``.
     :raises TypeError: If the configured workload class cannot be resolved.
     """
@@ -147,7 +159,17 @@ def _create_workload(
 
     from extradite import extradite
 
-    proxy_type: type = extradite(BENCHMARK_TARGET)
+    if share_keepalive_seconds is None:
+        proxy_type = extradite(
+            BENCHMARK_TARGET,
+            share_key=share_key,
+        )
+    else:
+        proxy_type = extradite(
+            BENCHMARK_TARGET,
+            share_key=share_key,
+            share_keepalive_seconds=share_keepalive_seconds,
+        )
     workload_obj = proxy_type(_SEED, rounds=rounds)
     return workload_obj, proxy_type
 
@@ -503,6 +525,7 @@ def _run_case_mixed_pipeline(workload: object, iterations: int) -> dict[str, obj
 
 _CASE_RUNNERS: dict[str, CaseRunner] = {
     "cold_start_first_call": _run_case_tiny_ping,
+    "cold_start_first_call_warm_session": _run_case_tiny_ping,
     "tiny_ping": _run_case_tiny_ping,
     "increment_small": _run_case_increment_small,
     "payload_small_checksum": _run_case_payload_small_checksum,
@@ -538,19 +561,38 @@ def _run_worker_case(
 
     runner: CaseRunner = _CASE_RUNNERS[case_name]
     include_setup: bool = _CASE_INCLUDE_SETUP_IN_TIMING[case_name]
+    warm_session_case: bool = (
+        mode == "extradite" and case_name == "cold_start_first_call_warm_session"
+    )
+    shared_session_key: str | None = None
+    shared_session_keepalive_seconds: float | None = None
+    if warm_session_case is True:
+        shared_session_key = "benchmark-cold-warm-session"
+        shared_session_keepalive_seconds = 60.0
 
     if include_setup is True:
         summary_xor: int = 0
         start_time: float = time.perf_counter()
-        for _ in range(iterations):
-            workload_obj: object
-            proxy_type: type | None
-            workload_obj, proxy_type = _create_workload(mode, rounds)
-            try:
-                summary: dict[str, object] = runner(workload_obj, 1)
-                summary_xor ^= _summary_fingerprint(summary)
-            finally:
-                _close_workload(workload_obj, proxy_type)
+        try:
+            for _ in range(iterations):
+                workload_obj: object
+                proxy_type: type | None
+                workload_obj, proxy_type = _create_workload(
+                    mode,
+                    rounds,
+                    share_key=shared_session_key,
+                    share_keepalive_seconds=shared_session_keepalive_seconds,
+                )
+                try:
+                    summary: dict[str, object] = runner(workload_obj, 1)
+                    summary_xor ^= _summary_fingerprint(summary)
+                finally:
+                    _close_workload(workload_obj, proxy_type)
+        finally:
+            if shared_session_key is not None:
+                from extradite import close_extradite_session
+
+                close_extradite_session(shared_session_key)
         elapsed_seconds: float = time.perf_counter() - start_time
         return {
             "case_name": case_name,
@@ -561,7 +603,12 @@ def _run_worker_case(
             "summary": {"fingerprint_xor": summary_xor},
         }
 
-    workload_obj, proxy_type = _create_workload(mode, rounds)
+    workload_obj, proxy_type = _create_workload(
+        mode,
+        rounds,
+        share_key=shared_session_key,
+        share_keepalive_seconds=shared_session_keepalive_seconds,
+    )
     try:
         warmup_count: int = warmup_iterations
         if warmup_count > 0:
@@ -580,6 +627,10 @@ def _run_worker_case(
         }
     finally:
         _close_workload(workload_obj, proxy_type)
+        if shared_session_key is not None:
+            from extradite import close_extradite_session
+
+            close_extradite_session(shared_session_key)
 
 
 def _run_worker_from_cli(args: argparse.Namespace) -> int:

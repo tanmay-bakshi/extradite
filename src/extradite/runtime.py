@@ -2,6 +2,7 @@
 
 import atexit
 import io
+import math
 import multiprocessing
 import pickle
 import sys
@@ -374,6 +375,32 @@ def _validate_transport_policy(transport_policy: str) -> TransportPolicy:
     if transport_policy == "reference":
         return "reference"
     raise ValueError("transport_policy must be one of: reference, value")
+
+
+def _normalize_share_keepalive_seconds(
+    share_keepalive_seconds: float | None,
+) -> float | None:
+    """Validate and normalize shared-session keepalive seconds.
+
+    :param share_keepalive_seconds: Optional keepalive timeout in seconds.
+    :returns: Normalized timeout as ``float`` or ``None``.
+    :raises TypeError: If the timeout is not ``int``/``float``/``None``.
+    :raises ValueError: If timeout is negative or non-finite.
+    """
+    if share_keepalive_seconds is None:
+        return None
+    is_numeric: bool = isinstance(share_keepalive_seconds, int) or isinstance(
+        share_keepalive_seconds,
+        float,
+    )
+    if is_numeric is False:
+        raise TypeError("share_keepalive_seconds must be int, float, or None")
+    normalized: float = float(share_keepalive_seconds)
+    if math.isfinite(normalized) is False:
+        raise ValueError("share_keepalive_seconds must be finite")
+    if normalized < 0.0:
+        raise ValueError("share_keepalive_seconds must be >= 0")
+    return normalized
 
 
 def _extract_call_policy(kwargs: dict[str, object]) -> TransportPolicy | None:
@@ -1054,6 +1081,9 @@ class ExtraditeSession:
     _target_reference_counts: dict[str, int]
     _last_checked_import_epoch: int
     _last_checked_sys_modules_size: int
+    _share_keepalive_seconds: float
+    _pending_idle_close_timer: threading.Timer | None
+    _idle_close_generation: int
 
     def __init__(
         self,
@@ -1061,6 +1091,7 @@ class ExtraditeSession:
         close_callback: Callable[[], None] | None = None,
         transport_policy: TransportPolicy = "value",
         transport_type_rules: list[tuple[type[object], TransportPolicy]] | None = None,
+        share_keepalive_seconds: float = 0.0,
     ) -> None:
         """Initialize a session.
 
@@ -1068,6 +1099,7 @@ class ExtraditeSession:
         :param close_callback: Optional callback invoked once when the session closes.
         :param transport_policy: Wire transport policy for picklable values.
         :param transport_type_rules: Optional per-type transport rules.
+        :param share_keepalive_seconds: Idle keepalive timeout for shared sessions.
         """
         _ensure_import_hook_installed()
         self._share_key = share_key
@@ -1091,6 +1123,53 @@ class ExtraditeSession:
         self._target_reference_counts = {}
         self._last_checked_import_epoch = _get_import_epoch()
         self._last_checked_sys_modules_size = len(sys.modules)
+        self._share_keepalive_seconds = share_keepalive_seconds
+        self._pending_idle_close_timer = None
+        self._idle_close_generation = 0
+
+    def _cancel_pending_idle_close_locked(self) -> None:
+        """Cancel one pending idle-close timer while holding ``self._lock``."""
+        timer: threading.Timer | None = self._pending_idle_close_timer
+        self._pending_idle_close_timer = None
+        self._idle_close_generation += 1
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_idle_close(self) -> None:
+        """Schedule shared-session close after configured keepalive timeout."""
+        with self._lock:
+            self._cancel_pending_idle_close_locked()
+            is_closed: bool = self._is_closed
+            if is_closed is True:
+                return
+            has_active_targets: bool = len(self._target_reference_counts) > 0
+            if has_active_targets is True:
+                return
+            self._idle_close_generation += 1
+            generation: int = self._idle_close_generation
+            timer = threading.Timer(
+                self._share_keepalive_seconds,
+                self._close_if_still_idle_from_timer,
+                args=(generation,),
+            )
+            timer.daemon = True
+            self._pending_idle_close_timer = timer
+        timer.start()
+
+    def _close_if_still_idle_from_timer(self, generation: int) -> None:
+        """Close the session when timer ``generation`` still matches and session is idle.
+
+        :param generation: Scheduled timer generation.
+        """
+        should_close: bool = False
+        with self._lock:
+            same_generation: bool = generation == self._idle_close_generation
+            has_active_targets: bool = len(self._target_reference_counts) > 0
+            if same_generation is True and has_active_targets is False and self._is_closed is False:
+                self._pending_idle_close_timer = None
+                should_close = True
+        if should_close is True:
+            self.close()
 
     @property
     def is_closed(self) -> bool:
@@ -1145,6 +1224,7 @@ class ExtraditeSession:
         remote_target: str = f"{module_name}:{class_qualname}"
         with self._lock:
             self.start()
+            self._cancel_pending_idle_close_locked()
 
             existing_object_id: int | None = self._class_object_ids_by_target.get(remote_target)
             if existing_object_id is not None:
@@ -1186,6 +1266,7 @@ class ExtraditeSession:
         :param remote_target: Remote target in ``module.path:ClassName`` format.
         """
         should_close: bool = False
+        keepalive_enabled: bool = False
         with self._lock:
             current_count: int | None = self._target_reference_counts.get(remote_target)
             if current_count is None:
@@ -1198,8 +1279,14 @@ class ExtraditeSession:
             self._target_reference_counts.pop(remote_target, None)
             self._class_object_ids_by_target.pop(remote_target, None)
             should_close = len(self._target_reference_counts) == 0
+            keepalive_enabled = (
+                self._share_key is not None and self._share_keepalive_seconds > 0.0
+            )
 
         if should_close is True:
+            if keepalive_enabled is True:
+                self._schedule_idle_close()
+                return
             self.close()
 
     def _assert_module_not_loaded(self, module_name: str) -> None:
@@ -2258,12 +2345,16 @@ class ExtraditeSession:
     def close(self) -> None:
         """Close the session and terminate the child process."""
         close_callback: Callable[[], None] | None = None
+        pending_idle_close_timer: threading.Timer | None = None
         with self._lock:
             already_closed: bool = self._is_closed
             if already_closed is True:
                 return
 
             self._is_closed = True
+            pending_idle_close_timer = self._pending_idle_close_timer
+            self._pending_idle_close_timer = None
+            self._idle_close_generation += 1
             connection: Connection | None = self._connection
             process: multiprocessing.Process | None = self._process
 
@@ -2301,6 +2392,9 @@ class ExtraditeSession:
             close_callback = self._close_callback
             self._close_callback = None
 
+        if pending_idle_close_timer is not None:
+            pending_idle_close_timer.cancel()
+
         if close_callback is not None:
             close_callback()
 
@@ -2321,15 +2415,23 @@ def _get_or_create_shared_session(
     share_key: str,
     transport_policy: TransportPolicy,
     transport_type_rules: list[tuple[type[object], TransportPolicy]],
+    share_keepalive_seconds: float | None = None,
+    new_session_default_keepalive_seconds: float = 0.0,
 ) -> tuple[ExtraditeSession, bool]:
     """Get or create a shared session for ``share_key``.
 
     :param share_key: Shared-session key.
     :param transport_policy: Requested transport policy.
     :param transport_type_rules: Requested per-type transport rules.
+    :param share_keepalive_seconds: Optional requested keepalive timeout.
+    :param new_session_default_keepalive_seconds: Keepalive timeout used for new sessions
+        when no explicit keepalive was requested.
     :returns: Tuple of ``(session, was_created)``.
     :raises ValueError: If an active shared session has conflicting policy settings.
     """
+    requested_keepalive: float = new_session_default_keepalive_seconds
+    if share_keepalive_seconds is not None:
+        requested_keepalive = share_keepalive_seconds
     with _SHARED_SESSION_LOCK:
         existing: ExtraditeSession | None = _SHARED_SESSIONS_BY_KEY.get(share_key)
         if existing is not None:
@@ -2349,6 +2451,19 @@ def _get_or_create_shared_session(
                     raise ValueError(
                         "share_key already exists with conflicting transport_type_rules"
                     )
+                keepalive_conflict_requested: bool = share_keepalive_seconds is not None
+                if keepalive_conflict_requested is True:
+                    same_keepalive: bool = (
+                        existing._share_keepalive_seconds == requested_keepalive
+                    )
+                    if same_keepalive is False:
+                        raise ValueError(
+                            "share_key already exists with share_keepalive_seconds="
+                            + f"{existing._share_keepalive_seconds!r}; requested "
+                            + f"{requested_keepalive!r}"
+                        )
+                with existing._lock:
+                    existing._cancel_pending_idle_close_locked()
                 return existing, False
             _SHARED_SESSIONS_BY_KEY.pop(share_key, None)
 
@@ -2357,9 +2472,63 @@ def _get_or_create_shared_session(
             close_callback=lambda: _remove_shared_session_if_current(share_key, session),
             transport_policy=transport_policy,
             transport_type_rules=transport_type_rules,
+            share_keepalive_seconds=requested_keepalive,
         )
         _SHARED_SESSIONS_BY_KEY[share_key] = session
         return session, True
+
+
+def prewarm_shared_session(
+    share_key: str,
+    transport_policy: TransportPolicy = "value",
+    transport_type_rules: dict[type[object], str] | None = None,
+    share_keepalive_seconds: float | None = None,
+) -> bool:
+    """Create or reuse one shared session and start its child process eagerly.
+
+    :param share_key: Shared-session key.
+    :param transport_policy: Requested transport policy.
+    :param transport_type_rules: Optional per-type transport rules.
+    :param share_keepalive_seconds: Optional idle keepalive timeout for this shared session.
+        When omitted and a new session is created, a default of ``30.0`` seconds is used.
+    :returns: ``True`` when a new shared session was created.
+    """
+    validated_transport_policy: TransportPolicy = _validate_transport_policy(transport_policy)
+    normalized_transport_type_rules: list[tuple[type[object], TransportPolicy]] = _normalize_transport_type_rules(
+        transport_type_rules
+    )
+    normalized_share_keepalive_seconds_obj: float | None = _normalize_share_keepalive_seconds(
+        share_keepalive_seconds
+    )
+    session, is_new_session = _get_or_create_shared_session(
+        share_key,
+        validated_transport_policy,
+        normalized_transport_type_rules,
+        share_keepalive_seconds=normalized_share_keepalive_seconds_obj,
+        new_session_default_keepalive_seconds=30.0,
+    )
+    try:
+        session.start()
+    except Exception:
+        traceback.format_exc()
+        if is_new_session is True:
+            session.close()
+        raise
+    return is_new_session
+
+
+def close_shared_session(share_key: str) -> bool:
+    """Close one active shared session by key.
+
+    :param share_key: Shared-session key.
+    :returns: ``True`` when an active session was found and closed.
+    """
+    with _SHARED_SESSION_LOCK:
+        session: ExtraditeSession | None = _SHARED_SESSIONS_BY_KEY.get(share_key)
+    if session is None:
+        return False
+    session.close()
+    return True
 
 
 def _build_proxy_class(
@@ -2394,6 +2563,7 @@ def create_extradited_class(
     share_key: str | None = None,
     transport_policy: TransportPolicy = "value",
     transport_type_rules: dict[type[object], str] | None = None,
+    share_keepalive_seconds: float | None = None,
 ) -> type:
     """Create a class proxy for an isolated import target.
 
@@ -2401,14 +2571,20 @@ def create_extradited_class(
     :param share_key: Optional key that reuses a child process across calls.
     :param transport_policy: Wire transport policy for picklable values.
     :param transport_type_rules: Optional per-type transport rules.
+    :param share_keepalive_seconds: Optional idle keepalive timeout for shared sessions.
     :returns: Dynamic proxy class for that target.
     :raises ExtraditeModuleLeakError: If target module already leaked into root process.
     """
     validated_transport_policy: TransportPolicy = _validate_transport_policy(transport_policy)
+    normalized_share_keepalive_seconds: float | None = _normalize_share_keepalive_seconds(
+        share_keepalive_seconds
+    )
     normalized_transport_type_rules: list[tuple[type[object], TransportPolicy]] = _normalize_transport_type_rules(
         transport_type_rules
     )
     module_name, class_qualname = _parse_target(target)
+    if share_key is None and normalized_share_keepalive_seconds is not None:
+        raise ValueError("share_keepalive_seconds requires share_key")
     session: ExtraditeSession
     is_new_session: bool
     if share_key is None:
@@ -2422,6 +2598,7 @@ def create_extradited_class(
             share_key,
             validated_transport_policy,
             normalized_transport_type_rules,
+            share_keepalive_seconds=normalized_share_keepalive_seconds,
         )
 
     try:

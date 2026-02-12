@@ -20,7 +20,9 @@ from extradite import ExtraditeModuleLeakError
 from extradite import ExtraditeProtocolError
 from extradite import ExtraditeRemoteError
 from extradite import UnsupportedInteractionError
+from extradite import close_extradite_session
 from extradite import extradite
+from extradite import prewarm_extradite_session
 
 TARGET_MODULE: str = "tests.fixtures.sandbox_target"
 TARGET_CLASS: str = "IsolatedCounter"
@@ -669,6 +671,54 @@ def test_share_key_rejects_conflicting_transport_type_rules() -> None:
         counter_cls.close()
 
 
+def test_share_keepalive_requires_share_key() -> None:
+    """Keepalive configuration should require shared-session mode."""
+    with pytest.raises(ValueError, match="requires share_key"):
+        extradite(TARGET, share_keepalive_seconds=1.0)
+
+
+def test_share_key_rejects_conflicting_share_keepalive_seconds() -> None:
+    """A shared session key must not mix conflicting keepalive settings."""
+    share_key: str = "keepalive-conflict"
+    counter_cls: type = extradite(
+        TARGET,
+        share_key=share_key,
+        share_keepalive_seconds=5.0,
+    )
+    try:
+        with pytest.raises(ValueError, match="share_keepalive_seconds"):
+            extradite(
+                TARGET,
+                share_key=share_key,
+                share_keepalive_seconds=1.0,
+            )
+    finally:
+        counter_cls.close()
+        close_extradite_session(share_key)
+
+
+def test_prewarm_and_close_shared_session_controls_lifecycle() -> None:
+    """Prewarm and explicit close APIs should control shared-session lifecycle."""
+    share_key: str = "prewarm-control"
+    created_first: bool = prewarm_extradite_session(
+        share_key,
+        share_keepalive_seconds=5.0,
+    )
+    created_second: bool = prewarm_extradite_session(share_key)
+    assert created_first is True
+    assert created_second is False
+
+    session_obj: object | None = runtime._SHARED_SESSIONS_BY_KEY.get(share_key)
+    assert session_obj is not None
+    assert isinstance(session_obj, runtime.ExtraditeSession) is True
+    assert session_obj.is_closed is False
+
+    closed_first: bool = close_extradite_session(share_key)
+    closed_second: bool = close_extradite_session(share_key)
+    assert closed_first is True
+    assert closed_second is False
+
+
 def test_policy_precedence_call_override_then_type_then_session() -> None:
     """Validate precedence: per-call override > per-type rule > session default."""
     counter_cls: type = extradite(
@@ -1274,6 +1324,81 @@ def test_share_key_reuses_session_across_different_targets() -> None:
             peer.close()
         counter_cls.close()
         peer_cls.close()
+
+
+def test_share_key_keepalive_reuses_running_session_after_class_close() -> None:
+    """Keepalive should allow process reuse after class-handle close."""
+    share_key: str = "keepalive-reuse"
+    first_cls: type = extradite(
+        TARGET,
+        share_key=share_key,
+        share_keepalive_seconds=5.0,
+    )
+    second_cls: type | None = None
+    first = None
+    second = None
+    try:
+        first = first_cls(2)
+        first_pid_obj: object = first.worker_pid()
+        assert isinstance(first_pid_obj, int) is True
+        first_pid: int = first_pid_obj
+
+        first.close()
+        first_cls.close()
+
+        session_obj: object | None = runtime._SHARED_SESSIONS_BY_KEY.get(share_key)
+        assert isinstance(session_obj, runtime.ExtraditeSession) is True
+        assert session_obj.is_closed is False
+
+        second_cls = extradite(TARGET, share_key=share_key)
+        second = second_cls(3)
+        second_pid_obj: object = second.worker_pid()
+        assert second_pid_obj == first_pid
+    finally:
+        if first is not None:
+            first.close()
+        if second is not None:
+            second.close()
+        first_cls.close()
+        if second_cls is not None:
+            second_cls.close()
+        close_extradite_session(share_key)
+
+
+def test_share_key_keepalive_timeout_closes_idle_session() -> None:
+    """Idle shared sessions should close automatically after keepalive timeout."""
+    share_key: str = "keepalive-timeout"
+    counter_cls: type = extradite(
+        TARGET,
+        share_key=share_key,
+        share_keepalive_seconds=0.05,
+    )
+    counter = None
+    session: runtime.ExtraditeSession | None = None
+    try:
+        counter = counter_cls(1)
+        session_obj: object = counter_cls._session
+        assert isinstance(session_obj, runtime.ExtraditeSession) is True
+        session = session_obj
+        counter.close()
+        counter_cls.close()
+
+        deadline: float = time.monotonic() + 2.0
+        while session.is_closed is False:
+            now: float = time.monotonic()
+            if now >= deadline:
+                break
+            time.sleep(0.02)
+        assert session.is_closed is True
+
+        with runtime._SHARED_SESSION_LOCK:
+            still_registered: bool = share_key in runtime._SHARED_SESSIONS_BY_KEY
+        assert still_registered is False
+    finally:
+        if counter is not None:
+            counter.close()
+        counter_cls.close()
+        close_extradite_session(share_key)
 
 
 def test_threaded_concurrency() -> None:
