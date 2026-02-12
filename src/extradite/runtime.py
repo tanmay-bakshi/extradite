@@ -1749,13 +1749,23 @@ class ExtraditeSession:
             attr_name_obj: object = message.get("attr_name")
             if isinstance(attr_name_obj, str) is False:
                 raise ExtraditeProtocolError("attr_name must be a string")
+            call_policy_obj: object = message.get("call_policy")
+            call_policy: str | None = None
+            if call_policy_obj is not None:
+                if isinstance(call_policy_obj, str) is False:
+                    raise ExtraditeProtocolError("call_policy must be a string")
+                try:
+                    _validate_transport_policy(call_policy_obj)
+                except ValueError as exc:
+                    raise ExtraditeProtocolError(str(exc)) from exc
+                call_policy = call_policy_obj
 
             target: object = self._local_object_registry.get(object_id_obj)
             attr_value: object = getattr(target, attr_name_obj)
             is_callable: bool = callable(attr_value)
             if is_callable is True:
                 return {"callable": True}
-            return {"callable": False, "value": self._encode_for_child(attr_value)}
+            return {"callable": False, "value": self._encode_for_child(attr_value, call_policy=call_policy)}
 
         if action == "set_attr":
             object_id_obj = message.get("object_id")
@@ -1790,6 +1800,16 @@ class ExtraditeSession:
             attr_name_obj = message.get("attr_name")
             if isinstance(attr_name_obj, str) is False:
                 raise ExtraditeProtocolError("attr_name must be a string")
+            call_policy_obj: object = message.get("call_policy")
+            call_policy: str | None = None
+            if call_policy_obj is not None:
+                if isinstance(call_policy_obj, str) is False:
+                    raise ExtraditeProtocolError("call_policy must be a string")
+                try:
+                    _validate_transport_policy(call_policy_obj)
+                except ValueError as exc:
+                    raise ExtraditeProtocolError(str(exc)) from exc
+                call_policy = call_policy_obj
 
             args, kwargs = self._decode_args_from_child(message)
             target = self._local_object_registry.get(object_id_obj)
@@ -1812,7 +1832,7 @@ class ExtraditeSession:
                     result = str(target)
             else:
                 result = callable_obj(*args, **kwargs)  # type: ignore[operator]
-            return {"value": self._encode_for_child(result)}
+            return {"value": self._encode_for_child(result, call_policy=call_policy)}
 
         if action == "call_attr_batch":
             object_id_obj = message.get("object_id")
@@ -1821,6 +1841,16 @@ class ExtraditeSession:
             attr_name_obj = message.get("attr_name")
             if isinstance(attr_name_obj, str) is False:
                 raise ExtraditeProtocolError("attr_name must be a string")
+            call_policy_obj: object = message.get("call_policy")
+            call_policy: str | None = None
+            if call_policy_obj is not None:
+                if isinstance(call_policy_obj, str) is False:
+                    raise ExtraditeProtocolError("call_policy must be a string")
+                try:
+                    _validate_transport_policy(call_policy_obj)
+                except ValueError as exc:
+                    raise ExtraditeProtocolError(str(exc)) from exc
+                call_policy = call_policy_obj
 
             call_specs: list[BatchCallSpec] = self._decode_batch_call_specs_from_child(message)
             target = self._local_object_registry.get(object_id_obj)
@@ -1845,7 +1875,7 @@ class ExtraditeSession:
                         result = str(target)
                 else:
                     result = callable_obj(*args, **kwargs)  # type: ignore[operator]
-                encoded_values.append(self._encode_for_child(result))
+                encoded_values.append(self._encode_for_child(result, call_policy=call_policy))
             return {"values": encoded_values}
 
         if action == "describe_object":

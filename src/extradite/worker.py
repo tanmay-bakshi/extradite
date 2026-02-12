@@ -7,6 +7,7 @@ import weakref
 from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
 from typing import Any
+from typing import ClassVar
 from typing import Literal
 
 from extradite.errors import ExtraditeProtocolError
@@ -25,6 +26,20 @@ _SHARED_MEMORY_BYTEARRAY_KIND: str = "bytearray"
 _PARENT_TYPE_PROXY_RUNTIME_ATTR: str = "__extradite_parent_type_proxy_runtime__"
 _PARENT_TYPE_PROXY_OBJECT_ID_ATTR: str = "__extradite_parent_type_proxy_object_id__"
 BatchCallSpec = tuple[list[object], dict[str, object]]
+
+
+def _validate_transport_policy(transport_policy: str) -> TransportPolicy:
+    """Validate a wire transport policy string.
+
+    :param transport_policy: Requested transport policy.
+    :returns: Normalized transport policy.
+    :raises ValueError: If the policy name is unsupported.
+    """
+    if transport_policy == "value":
+        return "value"
+    if transport_policy == "reference":
+        return "reference"
+    raise ValueError("transport_policy must be one of: reference, value")
 
 
 def _is_protected_module(module_name: str, protected_module_name: str) -> bool:
@@ -80,6 +95,12 @@ def _value_originates_from_module(
         return True
 
     if isinstance(value, (type(None), bool, int, float, complex, str, bytes)) is True:
+        return False
+
+    if isinstance(value, _ParentRemoteHandle) is True:
+        return False
+    parent_type_proxy_object_id: int | None = _extract_parent_type_proxy_object_id(value)
+    if parent_type_proxy_object_id is not None:
         return False
 
     identity: int = id(value)
@@ -639,7 +660,10 @@ class _ParentTypeProxyMeta(type):
         :param attr_name: Attribute name.
         :param value: Attribute value.
         """
-        is_internal: bool = attr_name.startswith("_")
+        is_internal: bool = (
+            attr_name == _PARENT_TYPE_PROXY_RUNTIME_ATTR
+            or attr_name == _PARENT_TYPE_PROXY_OBJECT_ID_ATTR
+        )
         if is_internal is True:
             super().__setattr__(attr_name, value)
             return
@@ -657,7 +681,10 @@ class _ParentTypeProxyMeta(type):
 
         :param attr_name: Attribute name.
         """
-        is_internal: bool = attr_name.startswith("_")
+        is_internal: bool = (
+            attr_name == _PARENT_TYPE_PROXY_RUNTIME_ATTR
+            or attr_name == _PARENT_TYPE_PROXY_OBJECT_ID_ATTR
+        )
         if is_internal is True:
             super().__delattr__(attr_name)
             return
@@ -795,6 +822,17 @@ class _ParentCallProxy:
 class _ParentRemoteHandle:
     """Proxy object for a parent-owned handle exposed to the worker."""
 
+    _INTERNAL_ATTR_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "_runtime",
+            "_remote_object_id",
+            "_is_closed",
+            "remote_object_id",
+            "close",
+            "_call_dunder",
+        }
+    )
+
     _runtime: "WorkerRuntime"
     _remote_object_id: int
     _is_closed: bool
@@ -808,6 +846,19 @@ class _ParentRemoteHandle:
         object.__setattr__(self, "_runtime", runtime)
         object.__setattr__(self, "_remote_object_id", object_id)
         object.__setattr__(self, "_is_closed", False)
+
+    def __getattribute__(self, attr_name: str) -> object:
+        """Intercept ``__dict__`` so that mutations reach the parent object.
+
+        :param attr_name: Attribute name.
+        :returns: Attribute value.
+        """
+        if attr_name != "__dict__":
+            return object.__getattribute__(self, attr_name)
+
+        runtime: WorkerRuntime = object.__getattribute__(self, "_runtime")
+        object_id: int = object.__getattribute__(self, "_remote_object_id")
+        return runtime.get_parent_attr(object_id, "__dict__", call_policy="reference")
 
     @property
     def remote_object_id(self) -> int:
@@ -831,10 +882,12 @@ class _ParentRemoteHandle:
         :param attr_name: Attribute name.
         :returns: Remote attribute value or call proxy.
         """
-        is_internal: bool = attr_name.startswith("_")
+        is_internal: bool = attr_name in _ParentRemoteHandle._INTERNAL_ATTR_NAMES
         if is_internal is True:
             raise AttributeError(attr_name)
-        return self._runtime.get_parent_attr(self._remote_object_id, attr_name)
+        runtime: WorkerRuntime = object.__getattribute__(self, "_runtime")
+        object_id: int = object.__getattribute__(self, "_remote_object_id")
+        return runtime.get_parent_attr(object_id, attr_name)
 
     def __setattr__(self, attr_name: str, value: object) -> None:
         """Set attributes in the parent process.
@@ -842,22 +895,26 @@ class _ParentRemoteHandle:
         :param attr_name: Attribute name.
         :param value: Attribute value.
         """
-        is_internal: bool = attr_name.startswith("_")
+        is_internal: bool = attr_name in _ParentRemoteHandle._INTERNAL_ATTR_NAMES
         if is_internal is True:
             object.__setattr__(self, attr_name, value)
             return
-        self._runtime.set_parent_attr(self._remote_object_id, attr_name, value)
+        runtime: WorkerRuntime = object.__getattribute__(self, "_runtime")
+        object_id: int = object.__getattribute__(self, "_remote_object_id")
+        runtime.set_parent_attr(object_id, attr_name, value)
 
     def __delattr__(self, attr_name: str) -> None:
         """Delete attributes in the parent process.
 
         :param attr_name: Attribute name.
         """
-        is_internal: bool = attr_name.startswith("_")
+        is_internal: bool = attr_name in _ParentRemoteHandle._INTERNAL_ATTR_NAMES
         if is_internal is True:
             object.__delattr__(self, attr_name)
             return
-        self._runtime.del_parent_attr(self._remote_object_id, attr_name)
+        runtime: WorkerRuntime = object.__getattribute__(self, "_runtime")
+        object_id: int = object.__getattribute__(self, "_remote_object_id")
+        runtime.del_parent_attr(object_id, attr_name)
 
     def _call_dunder(self, attr_name: str, *args: object) -> object:
         """Call one dunder method on the parent-owned object.
@@ -1819,18 +1876,22 @@ class WorkerRuntime:
 
             raise ExtraditeProtocolError("Incoming message must include either status or action")
 
-    def get_parent_attr(self, object_id: int, attr_name: str) -> object:
+    def get_parent_attr(self, object_id: int, attr_name: str, call_policy: str | None = None) -> object:
         """Get one parent-side attribute from a referenced object.
 
         :param object_id: Parent-owned object identifier.
         :param attr_name: Attribute name.
+        :param call_policy: Optional per-call transport override for the return value.
         :returns: Attribute value or call proxy.
         """
+        if call_policy is not None:
+            _validate_transport_policy(call_policy)
         response_payload: dict[str, object] = self._send_request_to_parent(
             "get_attr",
             {
                 "object_id": object_id,
                 "attr_name": attr_name,
+                "call_policy": call_policy,
             },
         )
         callable_obj: object = response_payload.get("callable")
@@ -1849,6 +1910,7 @@ class WorkerRuntime:
         attr_name: str,
         args: list[object],
         kwargs: dict[str, object],
+        call_policy: str | None = None,
     ) -> object:
         """Call one parent-side attribute.
 
@@ -1856,8 +1918,11 @@ class WorkerRuntime:
         :param attr_name: Callable attribute name.
         :param args: Positional arguments.
         :param kwargs: Keyword arguments.
+        :param call_policy: Optional per-call transport override for the return value.
         :returns: Decoded return value.
         """
+        if call_policy is not None:
+            _validate_transport_policy(call_policy)
         shared_memory_names: list[str] = []
         encoded_args: list[object] = [
             self._encode_for_parent(item, shared_memory_names=shared_memory_names)
@@ -1877,6 +1942,7 @@ class WorkerRuntime:
                 "attr_name": attr_name,
                 "args": encoded_args,
                 "kwargs": encoded_kwargs,
+                "call_policy": call_policy,
             },
             outbound_shared_memory_names=shared_memory_names,
         )
@@ -1930,15 +1996,19 @@ class WorkerRuntime:
         object_id: int,
         attr_name: str,
         call_specs: list[BatchCallSpec],
+        call_policy: str | None = None,
     ) -> list[object]:
         """Call one parent-side attribute repeatedly using one batched request.
 
         :param object_id: Parent-owned object identifier.
         :param attr_name: Callable attribute name.
         :param call_specs: Ordered list of ``(args, kwargs)`` call specifications.
+        :param call_policy: Optional per-call transport override for the return values.
         :returns: Ordered decoded result list.
         :raises ExtraditeProtocolError: If response payload shape is invalid.
         """
+        if call_policy is not None:
+            _validate_transport_policy(call_policy)
         shared_memory_names: list[str] = []
         encoded_calls: list[dict[str, object]] = self._encode_batch_call_specs_for_parent(
             call_specs,
@@ -1950,6 +2020,7 @@ class WorkerRuntime:
                 "object_id": object_id,
                 "attr_name": attr_name,
                 "calls": encoded_calls,
+                "call_policy": call_policy,
             },
             outbound_shared_memory_names=shared_memory_names,
         )
